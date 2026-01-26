@@ -53,9 +53,13 @@ class XueqiuSpider:
 
     def _format_time(self, timestamp):
         try:
-            ts = float(timestamp) / 1000
-            time_local = time.localtime(ts)
-            return time.strftime("%Y-%m-%d %H:%M:%S", time_local)
+            # 兼容 Unix 时间戳
+            if str(timestamp).isdigit():
+                ts = float(timestamp) / 1000
+                time_local = time.localtime(ts)
+                return time.strftime("%Y-%m-%d %H:%M:%S", time_local)
+            # 兼容参考代码中的 datetime 字符串格式
+            return str(timestamp)
         except: return str(timestamp)
 
     def random_sleep(self, min_s=1.0, max_s=2.0):
@@ -63,7 +67,6 @@ class XueqiuSpider:
 
     def safe_action(self):
         self._check_405()
-        # 循环处理滑块，直到消失
         max_retries = 10
         count = 0
         while self._has_slider():
@@ -82,7 +85,6 @@ class XueqiuSpider:
         except: return False
 
     def _solve_slider(self):
-        # print("\n>>> [滑块] 动作执行...")
         tab = self.driver.latest_tab
         time.sleep(1)
         try:
@@ -105,10 +107,10 @@ class XueqiuSpider:
         time.sleep(2)
         self.driver = self._init_browser()
 
-    # ================= AI 线程 (保持不变) =================
+    # ================= AI 线程 =================
     
     def global_ai_worker(self):
-        print(">>> [后台AI] 引擎启动...")
+        print(">>> [后台AI] 引擎已启动，调试模式开启...")
         while True:
             raw_batch = self.db.get_unanalyzed_raw_data(limit=10)
             if not raw_batch:
@@ -119,67 +121,62 @@ class XueqiuSpider:
                 sid, content = row['Status_Id'], row['Description']
                 clean = re.sub(r'<[^>]+>', '', content).strip().replace('\n', ' ')
                 
-                if len(clean) < 30:
+                if len(clean) < 10: 
                     self.db.mark_raw_as_analyzed(sid, 1); continue
 
-                # 2. 优化 prompt
-                prompt = f"""判断以下评论是否有投资价值（含个股逻辑或行业干货）：
-                评论：{clean}
-                仅输出JSON:{{"valuable": true}} 或 {{"valuable": false}}"""
+                prompt = f"""任务：判断这条财经评论是否有含金量。
+                评论内容："{clean}"
+                规则：1. 包含具体股票分析、逻辑、数据、新闻解读 -> valuable: true
+                2. 纯情绪发泄、打卡、无意义水贴 -> valuable: false
+                必须返回JSON格式：{{"valuable": true/false, "cat": "分类标签"}}"""
+                
                 try:
-                    res = ollama.chat(model=config.AI_MODEL_NAME, messages=[{'role':'user','content':prompt}], format='json',
-                                        options={
-                                            "num_predict": 20,
-                                            "temperature": 0.1,
-                                            "num_ctx": 2048,
-                                    })
+                    res = ollama.chat(
+                        model=config.AI_MODEL_NAME, 
+                        messages=[{'role':'user','content':prompt}],
+                        format='json', options={"temperature": 0.1}
+                    )
                     js = json.loads(res['message']['content'])
-                    if js.get('valuable', False):
-                        self.db.execute_one_safe(
-                            "INSERT OR IGNORE INTO Value_Comments VALUES (?,?,?,?,?,?)",
-                            (sid, row['User_Id'], row['Description'], row['Created_At'], row['Stock_Tags'], js.get('cat', '未知'))
-                        )
+                    valuable = js.get('valuable', False)
+                    cat = js.get('cat', '其他')
+                    
+                    final_cat = cat if valuable else f"[低价值]-{cat}"
+                    self.db.execute_one_safe(
+                        "INSERT OR IGNORE INTO Value_Comments VALUES (?,?,?,?,?,?)",
+                        (sid, row['User_Id'], row['Description'], row['Created_At'], row['Stock_Tags'], final_cat)
+                    )
+                    
+                    if valuable:
+                        print(f"    [AI] 🟢 收录 | {cat} | {clean[:15]}...")
                         self.total_ai_saved += 1
+                    else:
+                        print(f"    [AI] ⚪ 丢弃 | {cat} | {clean[:15]}...", end='\r')
                     self.db.mark_raw_as_analyzed(sid, 1)
-                except: self.db.mark_raw_as_analyzed(sid, 2)
+                except Exception as e:
+                    self.db.mark_raw_as_analyzed(sid, 2)
 
     # ================= Step 1: 批次扫描 =================
 
     def step1_batch_scan(self):
-        """
-        扫描关注列表，直到找到 BATCH_SIZE 个新的优质用户，或者扫描完当前宿主。
-        """
-        # 如果已经有足够多的待处理 Step 2 任务，就先跳过 Step 1，防止堆积太多
         pending_hq = len(self.db.get_pending_tasks("High_quality_users", limit=config.PIPELINE_BATCH_SIZE * 5))
-        if pending_hq >= config.PIPELINE_BATCH_SIZE * 5:
-             # print(">>> [跳过Step1] 待筛选用户充足，优先去筛选...")
-             return
+        if pending_hq >= config.PIPELINE_BATCH_SIZE * 5: return
 
-        # === 【修改点】在这里检查总人数上限 ===
-        # 如果库里的人数已经超过了设定的限制，就不再扫描新人了，直接返回
         current_users_count = self.db.get_total_users_count()
-        if current_users_count >= config.FOCUS_COUNT_LIMIT:
-            # 可以在这里打印一句提示，也可以不打印，保持清爽
-            # print(f">>> [跳过Step1] 用户库已满 ({current_users_count}/{config.FOCUS_COUNT_LIMIT})")
-            return
+        if current_users_count >= config.FOCUS_COUNT_LIMIT: return
 
         print(f"\n=== Step 1: 寻找新用户 (目标新增: {config.PIPELINE_BATCH_SIZE} 人) ===")
-        
-        # 寻找宿主
         if self.db.is_user_scanned(self.seed_id): current_source_id = None
         else: current_source_id = self.seed_id
         
-        # 如果没有指定宿主，找新的
         if not current_source_id:
             next_user = self.db.get_next_source_user()
             if not next_user: print(">>> 无可用宿主"); return
             current_source_id = next_user['User_Id']
             print(f">>> 切换宿主: {next_user['User_Name']}")
-        else:
-            print(f">>> 继续宿主: {current_source_id}")
+        else: print(f">>> 继续宿主: {current_source_id}")
 
         tab = self.driver.latest_tab
-        new_hq_added_in_this_batch = 0 # 本批次计数器
+        new_hq_added_in_this_batch = 0
         
         try:
             tab.get(f"https://xueqiu.com/u/{current_source_id}")
@@ -188,25 +185,18 @@ class XueqiuSpider:
                 btn = tab.ele('tag:a@@href=#/follow', timeout=3)
                 if btn: btn.click()
                 else: 
-                    self.db.mark_user_as_scanned(current_source_id)
-                    return # 换人
+                    self.db.mark_user_as_scanned(current_source_id); return
             
             tab.listen.start(config.API['FOCUS'])
             page_count = 0
             
-            # 翻页循环
             while True:
                 self.safe_action()
-                
-                # 退出条件1: 本批次任务完成
-                if new_hq_added_in_this_batch >= config.PIPELINE_BATCH_SIZE:
-                    # print(f">>> [暂停Step1] 本批次已找到 {new_hq_added_in_this_batch} 个新人，转入筛选...")
-                    break 
+                if new_hq_added_in_this_batch >= config.PIPELINE_BATCH_SIZE: break 
 
                 next_btn = tab.ele('.pagination__next', timeout=3)
                 if not next_btn or not next_btn.states.is_displayed: 
-                    self.db.mark_user_as_scanned(current_source_id) # 到底了，标记完成
-                    break
+                    self.db.mark_user_as_scanned(current_source_id); break
                 
                 next_btn.click(by_js=True)
                 self.random_sleep()
@@ -229,33 +219,22 @@ class XueqiuSpider:
                         new_users.append(row)
                         
                         if int(u.get('followers_count', 0)) > 5000: 
-                            hq_row = list(row)
-                            hq_row[-1] = None 
+                            hq_row = list(row); hq_row[-1] = None 
                             new_hq.append(tuple(hq_row))
-                            
                             new_hq_added_in_this_batch += 1
                     
                     if new_users: self.db.execute_many_safe("INSERT OR IGNORE INTO users VALUES (?,?,?,?,?,?,?)", new_users)
                     if new_hq: self.db.execute_many_safe("INSERT OR IGNORE INTO High_quality_users VALUES (?,?,?,?,?,?,?)", new_hq)
-                    
                     print(f"    [扫描] 本轮新增优质: {new_hq_added_in_this_batch}/{config.PIPELINE_BATCH_SIZE}", end='\r')
 
                 page_count += 1
-                # 限制单人扫描页数，防止死磕一个人
-                if page_count > 20: 
-                    # print("    单人扫描超过20页，暂时切换...")
-                    break 
-            
+                if page_count > 20: break 
             tab.listen.stop()
-
-        except Exception as e:
-            # print(f"Step1 Err: {e}")
-            pass
+        except Exception as e: pass
 
     # ================= Step 2: 批次筛选 =================
 
     def step2_batch_filter(self):
-        # 只取 BATCH_SIZE 个待办
         pending = self.db.get_pending_tasks("High_quality_users", limit=config.PIPELINE_BATCH_SIZE)
         if not pending: return
 
@@ -279,8 +258,6 @@ class XueqiuSpider:
                 stock_btn = tab.ele('tag:a@@href=#/stock', timeout=4)
                 if stock_btn:
                     stock_btn.click()
-                    
-                    # 循环监听
                     end_time = time.time() + 4
                     has_agu = False; has_waipan = False; now_str = self._get_now_str()
                     
@@ -290,8 +267,7 @@ class XueqiuSpider:
                         data = res.response.body
                         if not data: continue
 
-                        # A. 组合
-                        if 'net_value' in str(data):
+                        if 'net_value' in str(data): # 组合
                             comb_list = []
                             iterator = data.values() if isinstance(data, dict) else data
                             for item in iterator:
@@ -299,8 +275,7 @@ class XueqiuSpider:
                                 comb_list.append((uid, item.get('symbol'), item.get('name'), float(item.get('net_value',0) or 0), str(item.get('total_gain',0)), str(item.get('monthly_gain',0)), str(item.get('daily_gain',0)), now_str))
                             if comb_list: self.db.execute_many_safe("INSERT OR REPLACE INTO User_Combinations (User_Id, Symbol, Name, Net_Value, Total_Gain, Monthly_Gain, Daily_Gain, Updated_At) VALUES (?,?,?,?,?,?,?,?)", comb_list)
 
-                        # B. 自选股
-                        else:
+                        else: # 自选股
                             items = []
                             if isinstance(data, dict):
                                 if 'data' in data and 'items' in data['data']: items = data['data']['items']
@@ -319,10 +294,7 @@ class XueqiuSpider:
                                 if stock_list: self.db.execute_many_safe("INSERT OR REPLACE INTO User_Stocks (User_Id, Stock_Name, Stock_Symbol, Current_Price, Percent, Market, Updated_At) VALUES (?,?,?,?,?,?,?)", stock_list)
 
                     if has_agu and has_waipan:
-                        target_data = list(row)
-                        # 【核心修改】新发现的目标，时间必须设为 None，Step 3 才会去爬它！
-                        target_data[-1] = None 
-                        
+                        target_data = list(row); target_data[-1] = None # Step 3 待办
                         self.db.execute_one_safe("INSERT OR IGNORE INTO Target_users VALUES (?,?,?,?,?,?,?)", tuple(target_data))
                         self.target_ids_cache.add(uid)
                     tab.listen.stop()
@@ -330,10 +302,85 @@ class XueqiuSpider:
                 self.db.update_task_status(uid, "High_quality_users")
             except: pass
 
-    # ================= Step 3: 批次爬取 =================
+    # ================= Step 3: 批次爬取 (含长文逻辑) =================
+
+    def _mine_long_articles(self, tab, uid):
+        """【新增】专门挖掘长文，获取完整内容"""
+        try:
+            # 1. 尝试点击“长文”标签
+            # 使用 contains 模糊匹配防止页面微调
+            long_tab = tab.ele('xpath://a[contains(text(), "长文")]', timeout=2)
+            if not long_tab: return 0
+            
+            long_tab.click()
+            self.random_sleep(1.5, 2.5)
+            
+            # 2. 获取当前页面所有长文卡片
+            # 参考代码使用的 class 选择器
+            articles = tab.eles('.timeline__item__content timeline__item__content--longtext', timeout=3)
+            if not articles: return 0
+            
+            count = 0
+            # 限制每次只爬前 5 篇长文，避免太慢
+            for article_ele in articles[:5]:
+                try:
+                    # 点击进入长文详情页 (这会打开新标签或在当前页跳转，DrissionPage 会自动处理新 Tab)
+                    article_ele.click()
+                    time.sleep(2)
+                    
+                    # 获取最新标签页（即文章详情页）
+                    detail_tab = self.driver.latest_tab
+                    
+                    # === 抓取逻辑 ===
+                    current_url = detail_tab.url
+                    # 提取 ID: https://xueqiu.com/12345/67890 -> status_id = 67890
+                    parts = current_url.split('/')
+                    if len(parts) >= 5:
+                        comment_id = parts[-1]
+                        
+                        # 获取时间
+                        pub_time = ""
+                        time_ele = detail_tab.ele('xpath://div[@class="avatar__subtitle"]/a/time', timeout=2)
+                        if time_ele:
+                            # 可能是 text 或 datetime 属性
+                            pub_time = time_ele.attr('datetime') or time_ele.text
+                            pub_time = self._format_time(pub_time)
+
+                        # 获取全量内容 (标题 + 正文)
+                        title_ele = detail_tab.ele('.article__bd__title', timeout=2)
+                        content_ele = detail_tab.ele('.article__bd__detail', timeout=2)
+                        
+                        full_text = ""
+                        if title_ele: full_text += f"【长文标题】{title_ele.text}\n"
+                        if content_ele: full_text += f"{content_ele.text}"
+                        
+                        if full_text and comment_id.isdigit():
+                            # === 入库 ===
+                            # 使用 REPLACE，如果之前 JSON 抓到过截断版，这里会用完整版覆盖
+                            self.db.execute_one_safe(
+                                "INSERT OR REPLACE INTO Raw_Statuses (Status_Id, User_Id, Description, Created_At, Stock_Tags, Is_Analyzed) VALUES (?,?,?,?,?,?)",
+                                (comment_id, uid, full_text, pub_time, "LongArticle", 0) # 重置为 0 让 AI 重新分析
+                            )
+                            count += 1
+                            print(f"    --> [长文] 获取成功: {comment_id} (字数: {len(full_text)})")
+
+                    # 关闭详情页，切回列表页
+                    detail_tab.close()
+                    time.sleep(1)
+                    
+                except Exception as e:
+                    # print(f"长文抓取单条失败: {e}")
+                    # 如果出错了，确保把可能打开的标签页关掉
+                    if self.driver.tabs_count > 1:
+                        self.driver.latest_tab.close()
+            
+            return count
+
+        except Exception as e:
+            # print(f"长文模块异常: {e}")
+            return 0
 
     def step3_batch_mine(self):
-        # 只取 BATCH_SIZE 个待办
         pending = self.db.get_pending_tasks("Target_users", limit=config.PIPELINE_BATCH_SIZE)
         if not pending: return
 
@@ -347,21 +394,16 @@ class XueqiuSpider:
             
             self.safe_action()
             try:
-                # 【修改点1】使用更短的关键词，防止 API 变动导致匹配不上
-                # 雪球 API 通常包含 'user_timeline.json'
+                # === 阶段 1: 快速抓取 JSON (短贴 + 动态) ===
                 target_api = 'user_timeline.json'
                 tab.listen.start(target_api)
                 
                 tab.get(f"https://xueqiu.com/u/{uid}")
                 
-                # 【修改点2】第一页：死等数据包返回，最多等 5 秒
-                # 这种 wait 模式比 steps 更稳健，它会一直阻塞直到抓到那个特定包
+                # 等待第一页 JSON
                 res = tab.listen.wait(timeout=5)
                 
-                pages = int(config.ARTICLE_COUNT_LIMIT / 10)
                 total_added = 0 
-                
-                # 处理第一页数据
                 if res and res.response.body and 'statuses' in res.response.body:
                     raw_rows = []
                     for s in res.response.body['statuses']:
@@ -371,24 +413,15 @@ class XueqiuSpider:
                         self.db.execute_many_safe("INSERT OR IGNORE INTO Raw_Statuses (Status_Id, User_Id, Description, Created_At, Stock_Tags, Is_Analyzed) VALUES (?,?,?,?,?,?)", raw_rows)
                         total_added += len(raw_rows)
                 else:
-                    # 如果第一页都没抓到，打印一下它到底抓到了啥，方便调试
-                    if res:
-                        print(f"    ⚠️ 第一页数据包异常，URL: {res.request.url}")
-                    else:
-                        print(f"    ⚠️ 第一页超时未抓到包")
+                     if not res: print(f"    ⚠️ 第一页超时")
 
-                # 处理后续翻页
-                for p in range(pages - 1): # 减1是因为刚才已经处理了第0页
-                    # 翻页前检查滑块
+                # 简单翻两页 (获取更多短贴)
+                for p in range(2): 
                     if self._has_slider(): self.safe_action()
-
                     next_btn = tab.ele('.pagination__next', timeout=2)
                     if next_btn and next_btn.states.is_displayed: 
                         next_btn.click(by_js=True)
-                        
-                        # 【修改点3】翻页后也是死等
                         res = tab.listen.wait(timeout=5)
-                        
                         if res and res.response.body and 'statuses' in res.response.body:
                             raw_rows = []
                             for s in res.response.body['statuses']:
@@ -397,51 +430,22 @@ class XueqiuSpider:
                             if raw_rows:
                                 self.db.execute_many_safe("INSERT OR IGNORE INTO Raw_Statuses (Status_Id, User_Id, Description, Created_At, Stock_Tags, Is_Analyzed) VALUES (?,?,?,?,?,?)", raw_rows)
                                 total_added += len(raw_rows)
-                    else: 
-                        break # 没下一页了
-                
-                print(f"    -> 完成: {uname} (入库 {total_added} 条)")
+                    else: break
                 
                 tab.listen.stop()
+
+                # === 阶段 2: 深度抓取长文 (获取完整逻辑) ===
+                # 这里调用新增的方法
+                long_count = self._mine_long_articles(tab, uid)
+                
+                print(f"    -> 完成: {uname} (短贴: {total_added}, 长文补全: {long_count})")
                 self.db.update_task_status(uid, "Target_users")
                 
             except Exception as e:
                 print(f"    ❌ 异常 [{uname}]: {e}")
-                # 如果是连接断开，尝试重启
                 if "断开" in str(e) or "disconnected" in str(e): 
-                    self._restart_browser()
-                    tab = self.driver.latest_tab
-                else: 
-                    tab.listen.stop()
-
-    # === 【新增】统计报告打印 ===
-    def print_report(self):
-        print("\n" + "="*60)
-        print("                 📊 爬虫运行报告 📊")
-        print("="*60)
-        
-        total_users = self.db.get_total_users_count()
-        total_targets = self.db.get_target_count()
-        total_comments = self.db.get_total_comments_count()
-        ai_left = self.db.get_unanalyzed_count()
-        db_size = self.db.get_db_size()
-        
-        print(f"1. 👥 用户扫描总库:  {total_users} / {config.FOCUS_COUNT_LIMIT} 人")
-        print(f"2. 🎯 目标用户(双修): {total_targets} / {config.TARGET_GOAL} 人")
-        print(f"3. 💎 高价值评论入库: {total_comments} 条")
-        print(f"4. ⏳ AI后台积压数据: {ai_left} 条 (建议跑 run_ai_only.py 消化)")
-        print(f"5. 💾 数据库文件大小: {db_size} MB")
-        
-        print("-" * 60)
-        print("🛑 停止原因判定:")
-        
-        if total_targets >= config.TARGET_GOAL:
-            print("   ✅ 【成功】已收集到足够的目标用户！")
-        elif total_users >= config.FOCUS_COUNT_LIMIT:
-            print("   ⚠️ 【上限】已达到扫描用户数量上限，建议增加 FOCUS_COUNT_LIMIT。")
-        else:
-            print("   👋 【手动】用户手动中断或暂无更多新数据。")
-        print("="*60 + "\n")
+                    self._restart_browser(); tab = self.driver.latest_tab
+                else: tab.listen.stop()
 
     def run(self):
         print(">>> 启动...")
@@ -451,48 +455,27 @@ class XueqiuSpider:
         self.driver.get("https://xueqiu.com")
         print("\n" + "="*50); input(">>> 请扫码登录，完成后按【回车】..."); print("="*50 + "\n")
         
-        # === 使用 try...except 捕获 Ctrl+C ===
         try:
             while True:
-                # 1. 检查目标是否达成 (只有目标达成才是真正的“完结撒花”)
                 current_targets = self.db.get_target_count()
                 if current_targets >= config.TARGET_GOAL:
-                    print("\n>>> 🎉🎉🎉 恭喜！目标用户收集完成！🎉🎉🎉")
-                    break 
-                
-                # === 【修改点】移除这里的 FOCUS_COUNT_LIMIT 检查 ===
-                # 不要在这里 break！
-                # 即使 current_users >= 100，也要继续循环，因为 step2 和 step3 可能还有活要干
+                    print("\n>>> 🎉🎉🎉 恭喜！目标用户收集完成！🎉🎉🎉"); break 
                 
                 current_users = self.db.get_total_users_count()
-                
-                # 打印进度条
                 ai_backlog = self.db.get_unanalyzed_count()
                 print(f"\n>>> [循环] 目标:{current_targets}/{config.TARGET_GOAL} | 用户库:{current_users}/{config.FOCUS_COUNT_LIMIT} | AI积压:{ai_backlog}")
                 
-                # 流水线作业
-                self.step3_batch_mine()   # 优先消化库存
-                self.step2_batch_filter() # 优先筛选库存
-                self.step1_batch_scan()   # 最后才考虑进货 (内部会检查 LIMIT)
-                
-                # 如果所有步骤都没事干了（比如 Step1被限流，Step2/3也没待办），可以睡久一点避免空转
-                # 简单的处理是每次都睡 2 秒
+                self.step3_batch_mine()   
+                self.step2_batch_filter() 
+                self.step1_batch_scan()   
                 time.sleep(2)
 
-        except KeyboardInterrupt:
-            print("\n\n>>> 🛑 检测到用户中断 (Ctrl+C)...")
-        
-        except Exception as e:
-            print(f"\n\n>>> ❌ 发生未捕获异常: {e}")
-
+        except KeyboardInterrupt: print("\n\n>>> 🛑 检测到用户中断 (Ctrl+C)...")
+        except Exception as e: print(f"\n\n>>> ❌ 发生未捕获异常: {e}")
         finally:
             self.is_main_job_finished = True
-            self.print_report()
-            
             left = self.db.get_unanalyzed_count()
-            if left > 0:
-                print(f">>> 提示: AI 线程还在处理剩余的 {left} 条数据...")
-                # ai_thread.join()
+            if left > 0: print(f">>> 提示: AI 线程还在处理剩余的 {left} 条数据...")
 
 if __name__ == '__main__':
     bot = XueqiuSpider()
