@@ -55,7 +55,9 @@ class DBManager:
                 return
             except sqlite3.OperationalError as e:
                 if "locked" in str(e): time.sleep(1)
-                else: break
+                else: 
+                    print("error in execute sql: {e}")
+                    break
             finally:
                 if conn: conn.close()
 

@@ -9,14 +9,14 @@ MAC_CHROME_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
 print(f">>> [Config] 数据库路径: {DB_PATH}")
 
 SEED_USER_URL = 'https://xueqiu.com/u/9887656769' 
-ARTICLE_COUNT_LIMIT = 5
+ARTICLE_COUNT_LIMIT = 20
 
-FOCUS_COUNT_LIMIT = 100
-TARGET_GOAL = 20
+FOCUS_COUNT_LIMIT = 5
+TARGET_GOAL = 2
 
 # === 【新增】流水线批次大小 ===
 # 意思是：Step 1 找到 10 个优质用户就停下来，转而去跑 Step 2
-PIPELINE_BATCH_SIZE = 2
+PIPELINE_BATCH_SIZE = 1
 
 CACHE_DAYS = 21           
 AI_MODEL_NAME = "qwen3:4b-q4_K_M" 
@@ -43,11 +43,13 @@ SQL_CREATE_TABLES = [
     );""",
     """CREATE TABLE IF NOT EXISTS Raw_Statuses (
         Status_Id INTEGER PRIMARY KEY, User_Id INTEGER, Description TEXT, 
-        Created_At TEXT, Stock_Tags TEXT, Is_Analyzed INTEGER DEFAULT 0
+        Created_At TEXT, Stock_Tags TEXT, Is_Analyzed INTEGER DEFAULT 0,
+        Forward INTEGER, Comment_Count INTEGER, Like INTEGER
     );""",
     """CREATE TABLE IF NOT EXISTS Value_Comments (
         Comment_Id INTEGER PRIMARY KEY, User_Id INTEGER, Content TEXT, 
-        Publish_Time TEXT, Mentioned_Stocks TEXT, Category TEXT
+        Publish_Time TEXT, Mentioned_Stocks TEXT, Category TEXT, Forward INTEGER,
+        Comment_Count INTEGER, Like INTEGER
     );""",
     """CREATE TABLE IF NOT EXISTS User_Stocks (
         Record_Id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,6 +62,8 @@ SQL_CREATE_TABLES = [
         Updated_At TEXT,
         UNIQUE(User_Id, Stock_Symbol) ON CONFLICT REPLACE
     );""",
+    # 组合包含自建和收藏，我把两个放在一起，不做区分
+    # Close_At_Time为0，则说明这个组合已经关停
     """CREATE TABLE IF NOT EXISTS User_Combinations (
         Comb_Id INTEGER PRIMARY KEY AUTOINCREMENT,
         User_Id INTEGER,
@@ -70,6 +74,7 @@ SQL_CREATE_TABLES = [
         Monthly_Gain REAL,
         Daily_Gain REAL,
         Updated_At TEXT,
+        Close_At_Time TEXT,
         UNIQUE(User_Id, Symbol) ON CONFLICT REPLACE
     );"""
 ]
