@@ -19,7 +19,11 @@ TARGET_GOAL = 2
 PIPELINE_BATCH_SIZE = 1
 
 CACHE_DAYS = 21           
-AI_MODEL_NAME = "qwen3:4b-q4_K_M" 
+AI_MODEL_NAME = "qwen2.5:1.5b" 
+
+# 大V的门槛
+MIN_FOLLOWERS = 5000
+MIN_COMMENTS = 20
 
 API = {
     'FOCUS': 'friendships/groups/members.json',
@@ -30,15 +34,15 @@ API = {
 SQL_CREATE_TABLES = [
     """CREATE TABLE IF NOT EXISTS System_Meta (Key TEXT PRIMARY KEY, Value TEXT);""",
     """CREATE TABLE IF NOT EXISTS users (
-        User_Id INTEGER PRIMARY KEY, User_Name TEXT, Status_Count INTEGER, 
+        User_Id INTEGER PRIMARY KEY, User_Name TEXT, Comments_Count INTEGER, 
         Friends_Count INTEGER, Followers_Count INTEGER, Description TEXT, Last_Updated TEXT
     );""",
     """CREATE TABLE IF NOT EXISTS High_quality_users (
-        User_Id INTEGER PRIMARY KEY, User_Name TEXT, Status_Count INTEGER, 
+        User_Id INTEGER PRIMARY KEY, User_Name TEXT, Comments_Count INTEGER, 
         Friends_Count INTEGER, Followers_Count INTEGER, Description TEXT, Last_Updated TEXT
     );""",
     """CREATE TABLE IF NOT EXISTS Target_users (
-        User_Id INTEGER PRIMARY KEY, User_Name TEXT, Status_Count INTEGER, 
+        User_Id INTEGER PRIMARY KEY, User_Name TEXT, Comments_Count INTEGER, 
         Friends_Count INTEGER, Followers_Count INTEGER, Description TEXT, Last_Updated TEXT
     );""",
     """CREATE TABLE IF NOT EXISTS Raw_Statuses (
