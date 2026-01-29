@@ -2,7 +2,7 @@ import gzip
 import json
 import time
 import re
-
+from lxml import etree  # 必须导入
 import config
 from DrissionPage import ChromiumPage, ChromiumOptions
 import time
@@ -10,6 +10,7 @@ import threading
 import os
 import config
 from db_manager import DBManager
+from spider_tools import SpiderTools
 
 class SpiderPortfolioMixin:
     # ================= Step 3: 批次爬取 (含长文逻辑) =================
@@ -25,8 +26,78 @@ class SpiderPortfolioMixin:
         try: return ChromiumPage(co)
         except Exception as e: 
             print(f"\n[启动错误] {e}"); exit()
+    
+    # ================= 优化后的评论获取逻辑 =================
+    def _parse_comments_fragment(self, html_content):
+        """
+        核心提取逻辑：解析监听到的 HTML 片段
+        """
+        # 如果 body 是 bytes 类型，先解码
+        if isinstance(html_content, bytes):
+            html_text = html_content.decode('utf-8', errors='ignore')
+        else:
+            html_text = html_content
 
-    def _mine_long_articles(self, symbol):
+        tree = etree.HTML(html_text)
+        # 获取所有动态条目
+        items = tree.xpath('//div[contains(@class, "status-item")]')
+        results = []
+
+        for item in items:
+            try:
+                # 1. 提取作者名 (对应你截图中的：96船票_)
+                # 路径定位到 status-bd 下的 status-retweet-user 里的 a 标签
+                author = item.xpath('.//div[@class="status-retweet-user"]/a[@class="name"]/text()')
+                author_name = author[0].strip() if author else "未知作者"
+
+                # 2. 提取正文 (text 里的所有文字)
+                content_nodes1 = item.xpath('.//div[@class="text"]//text()')
+                content_nodes2 = item.xpath('.//script[@class="single-description"]//text()')
+                content_nodes = content_nodes2 if len(content_nodes1) < len(content_nodes2) else content_nodes1
+                content = content_nodes
+
+                # 3. 提取互动数 (点赞和讨论)
+                likes = item.xpath('.//a[contains(@class, "btn-like")]//em/text()')
+                comments = item.xpath('.//a[contains(@class, "btn-status-reply")]//em/text()')
+
+                results.append({
+                    "author": author_name,
+                    "text": content,
+                    "likes": likes[0] if likes else "0",
+                    "comments": comments[0] if comments else "0"
+                })
+            except Exception:
+                continue
+        return results
+    
+    def _portfolio_status(self, symbol, tab):
+            
+            # 2. 访问页面
+            url = f"https://xueqiu.com/P/{symbol}"
+            
+            # 假设 tab 是当前标签页对象
+            cube_closed = tab.ele('xpath://div[@class="cube-closed"]')
+
+            if cube_closed:
+                # 获取 .text 下的两个 p 标签
+                p_elements = cube_closed.eles('xpath:.//div[@class="text"]/p')
+                
+                create_time = None
+                close_time = None
+                
+                for p in p_elements:
+                    text = p.text.strip()
+                    if '创建于' in text:
+                        create_time = text.replace('创建于：', '').strip()
+                    elif '关停时间' in text:
+                        close_time = text.replace('关停时间：', '').strip()
+                
+                print(f"创建时间: {create_time}")
+                print(f"关停时间: {close_time}")
+            else:
+                print("组合开启中")
+
+    def _mine_portfolio(self, symbol):
         """
         组合详情获取逻辑：
         直接新建标签页访问组合详情页 URL (https://xueqiu.com/P/{symbol})，
@@ -96,70 +167,81 @@ class SpiderPortfolioMixin:
                     print(f"{name} | {price} | {weight}")
 
             # 获取 评论
-            # 等待评论列表加载（关键！）
-            # 等待 status-list 加载完成
-            status_list = detail_tab.ele('xpath://div[@class="status-list"]', timeout=5)
+            # 在 detail_tab 中执行一段 JS，一次性提取所有动态数据
+            # 1. 设置监听
+            self.driver.listen.start('cube/timeline')
+            
+            # 2. 访问页面
+            url = f"https://xueqiu.com/P/{symbol}"
+            self.driver.get(url)
+            
+            # 3. 触发加载 (向下滚动)
+            self.driver.scroll.down(1000)
+            
+            # 4. 获取拦截到的数据包
+            res = self.driver.listen.wait(timeout=5)
+            if res:
+                # 拿到接口返回的混合 HTML 文本
+                comments = self._parse_comments_fragment(res.response.body)
+                
+                for c in comments:
+                    print(f"【{c['author']}】: {c['text'][:50]}...")
+                    print(f"   📊 赞: {c['likes']} | 讨论: {c['comments']}")
+                    print("-" * 40)
+            else:
+                print("❌ 未捕获到 timeline 接口数据")
 
-            # 获取所有 status-item
-            items = status_list.eles('xpath:.//div[contains(@class, "status-item")]')
 
-            for item in items:
-                # 1. 提取正文文本（从 .text 中的所有 <p>）
-                text_div = item.ele('xpath:.//div[@class="text"]')
-                if text_div:
-                    paragraphs = text_div.eles('xpath:.//p')
-                    full_text = "\n".join([p.text for p in paragraphs])
-                else:
-                    full_text = ""
-
-                # 2. 提取互动数据
-                likes = item.ele('xpath:.//a[@class="btn-like"]//span[@class="number"]/em').text
-                reposts = item.ele('xpath:.//a[@class="btn-repost"]//span[@class="number"]/em').text
-                comments = item.ele('xpath:.//a[@class="btn-status-reply last"]//span[@class="number"]/em').text
-
-                # 打印结果
-                print(f"=== 动态内容 ===")
-                print(f"正文:\n{full_text}")
-                print(f"赞: {likes}, 转发: {reposts}, 讨论: {comments}")
-                print("-" * 50)
 
             # 获取历史调仓
-            # 获取当前列表页 Tab
-            list_tab = self.driver.latest_tab
-
-            try:
-                # 监听组合调仓历史接口（关键：用 'rebalancing/history.json' 作为关键词）
-                list_tab.listen.start('rebalancing/history.json')
-                # 访问组合页面（会触发 AJAX 请求）
-                list_tab.get(f"https://xueqiu.com/P/{symbol}")
-                # 等待接口响应（超时 5 秒）
-                res = list_tab.listen.wait(timeout=5)
-                if res is None:
-                    print("❌ 超时：未捕获到调仓记录接口")
-                # 获取 JSON 数据
-                rebalancing_data = res.response.json()
-                # 打印或处理数据
-                print(f"✅ 捕获到 {len(rebalancing_data.get('list', []))} 条调仓记录")
-                for item in rebalancing_data.get('list', [])[:5]:  # 打印前3条
-                    print(f"  - {item['name']} ({item['symbol']}) → {item['weight']}%")
-            except Exception as e:
-                print(f"⚠️ 处理用户 {symbol} 时出错: {str(e)}")
-                    
+            res_rebalances = self._mine_rebalance(symbol,detail_tab)
+            print(res_rebalances)
 
             # 抓取完成后关闭当前长文页
             detail_tab.close()
 
 
         except Exception as e:
-            # print(f"    ⚠️ 长文补全失败 {status_id}: {e}")
+            print(f"    ⚠️ 组合获取失败 {symbol}: {e}")
             # 异常保护：如果标签页没关掉，强制关闭
             if self.driver.tabs_count > 1:
                 # 简单判断一下当前页是不是列表页，如果不是就关掉
                 if str(symbol) not in self.driver.latest_tab.url:
                     self.driver.latest_tab.close()
             return None
-        
+    
+
+    def _mine_rebalance(self, symbol, tab):
+        try:
+            url = f"https://xueqiu.com/P/{symbol}"
+            # tab = self.driver.new_tab(url)
+            print(f"已打开组合页: {symbol}")
+
+            # 监听调仓接口
+            tab.listen.start('rebalancing/history.json')
+            tab.get(url)
+
+            btn = tab.ele('xpath://a[@class="history"]')
+            if btn:
+                btn.click(by_js=True)
+            # 等待请求（new_tab 已加载页面，直接等即可）
+            res = tab.listen.wait(timeout=3)
+            data = SpiderTools.decode_response(res)
+
+            if data is None:
+                print(f"❌ {symbol}: 未捕获到调仓记录接口")
+                return None
+
+
+        except Exception as e:
+            print(f"⚠️ {symbol} 出错: {e}")
+            return None
+        finally:
+            if 'tab' in locals():
+                tab.close()
+
+        return data
     
 
 aa = SpiderPortfolioMixin()
-aa._mine_long_articles('ZH3084474')
+aa._mine_portfolio('ZH3084474')

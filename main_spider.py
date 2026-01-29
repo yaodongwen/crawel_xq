@@ -5,12 +5,12 @@ import os
 import config
 from db_manager import DBManager
 
-from spider_ai import SpiderAIMixin
-from spider_comments import SpiderCommentsMixin
-from spider_tools import SpiderToolsMixin
+from spider_ai import AIWorker
+from spider_comments import CommentsCrawler
+from spider_tools import SpiderTools
 
 
-class XueqiuSpider(SpiderToolsMixin, SpiderAIMixin, SpiderCommentsMixin):
+class XueqiuSpider:
     def __init__(self):
         print(">>> [系统] 正在清理残留进程...")
         os.system("pkill -f 'Google Chrome'") 
@@ -28,6 +28,12 @@ class XueqiuSpider(SpiderToolsMixin, SpiderAIMixin, SpiderCommentsMixin):
         
         self.total_ai_saved = 0
         self.is_main_job_finished = False 
+        self._ai_worker = AIWorker(
+            db=self.db,
+            is_main_job_finished_fn=lambda: self.is_main_job_finished,
+            on_saved=self._on_ai_saved,
+        )
+        self._comments_crawler = CommentsCrawler(init_browser_fn=self._init_browser)
 
     def _init_browser(self):
         co = ChromiumOptions()
@@ -38,6 +44,15 @@ class XueqiuSpider(SpiderToolsMixin, SpiderAIMixin, SpiderCommentsMixin):
         try: return ChromiumPage(co)
         except Exception as e: 
             print(f"\n[启动错误] {e}"); exit()
+
+    def _on_ai_saved(self):
+        self.total_ai_saved += 1
+
+    def global_ai_worker(self):
+        self._ai_worker.run()
+
+    def step3_batch_mine(self):
+        self.driver = self._comments_crawler.step3_batch_mine(self.driver, self.db)
 
     # ================= Step 1: 批次扫描 =================
 
@@ -75,7 +90,7 @@ class XueqiuSpider(SpiderToolsMixin, SpiderAIMixin, SpiderCommentsMixin):
             page_count = 0
             
             while True:
-                self.safe_action()
+                SpiderTools.safe_action(self.driver)
                 if new_hq_added_in_this_batch >= config.PIPELINE_BATCH_SIZE: break 
 
                 next_btn = tab.ele('.pagination__next', timeout=3)
@@ -83,14 +98,14 @@ class XueqiuSpider(SpiderToolsMixin, SpiderAIMixin, SpiderCommentsMixin):
                     self.db.mark_user_as_scanned(current_source_id); break
                 
                 next_btn.click(by_js=True)
-                self.random_sleep()
+                SpiderTools.random_sleep()
                 
                 res = tab.listen.wait(timeout=6)
                 if res and 'users' in res.response.body:
                     users = res.response.body['users']
                     new_users = []
                     new_hq = []
-                    now_str = self._get_now_str()
+                    now_str = SpiderTools.get_now_str()
 
                     for u in users:
                         uid = u.get('id')
@@ -134,17 +149,17 @@ class XueqiuSpider(SpiderToolsMixin, SpiderAIMixin, SpiderCommentsMixin):
             if uid in self.target_ids_cache:
                 self.db.update_task_status(uid, "High_quality_users"); continue
             
-            self.safe_action()
+            SpiderTools.safe_action(self.driver)
             try:
                 tab.get(f"https://xueqiu.com/u/{uid}")
-                self.random_sleep(1.5, 2.0)
+                SpiderTools.random_sleep(1.5, 2.0)
                 tab.listen.start(config.API['STOCK'])
                 
                 stock_btn = tab.ele('tag:a@@href=#/stock', timeout=4)
                 if stock_btn:
                     stock_btn.click()
                     end_time = time.time() + 4
-                    has_agu = False; has_waipan = False; now_str = self._get_now_str()
+                    has_agu = False; has_waipan = False; now_str = SpiderTools.get_now_str()
                     
                     while time.time() < end_time:
                         res = tab.listen.wait(timeout=1.0)
