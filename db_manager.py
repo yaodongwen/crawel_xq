@@ -7,6 +7,7 @@ class DBManager:
     def __init__(self):
         self.db_path = DB_PATH
         self.init_tables()
+        # self._migrate_user_portfolio_follows_symbol()
         self._enable_wal()
 
     def get_conn(self):
@@ -31,6 +32,56 @@ class DBManager:
         except Exception as e: print(f"[DB Init Error] {e}")
         finally:
             if conn: conn.close()
+
+    # def _migrate_user_portfolio_follows_symbol(self):
+    #     """Switch User_Portfolio_Follows from Comb_Id to Symbol if needed."""
+    #     conn = None
+    #     try:
+    #         conn = self.get_conn()
+    #         cursor = conn.execute(
+    #             "SELECT name FROM sqlite_master WHERE type='table' AND name='User_Portfolio_Follows'"
+    #         )
+    #         if cursor.fetchone() is None:
+    #             return
+    #         cols = [r[1] for r in conn.execute("PRAGMA table_info(User_Portfolio_Follows)").fetchall()]
+    #         if 'Symbol' in cols:
+    #             return
+
+    #         conn.execute("DROP TABLE IF EXISTS User_Portfolio_Follows_new;")
+    #         conn.execute(
+    #             """
+    #             CREATE TABLE IF NOT EXISTS User_Portfolio_Follows_new (
+    #                 User_Id INTEGER NOT NULL,
+    #                 Symbol TEXT NOT NULL,
+    #                 Build_Or_Collection INTEGER,
+    #                 Follow_Time TEXT,
+    #                 PRIMARY KEY (User_Id, Symbol),
+    #                 FOREIGN KEY (User_Id) REFERENCES users(User_Id),
+    #                 FOREIGN KEY (Symbol) REFERENCES User_Combinations(Symbol)
+    #             );
+    #             """
+    #         )
+    #         conn.execute(
+    #             """
+    #             INSERT OR IGNORE INTO User_Portfolio_Follows_new (User_Id, Symbol, Build_Or_Collection, Follow_Time)
+    #             SELECT f.User_Id, c.Symbol, f.Build_Or_Collection, f.Follow_Time
+    #             FROM User_Portfolio_Follows f
+    #             JOIN User_Combinations c ON c.Comb_Id = f.Comb_Id;
+    #             """
+    #         )
+    #         conn.execute("DROP TABLE User_Portfolio_Follows;")
+    #         conn.execute("ALTER TABLE User_Portfolio_Follows_new RENAME TO User_Portfolio_Follows;")
+    #         conn.commit()
+    #     except Exception as e:
+    #         try:
+    #             if conn:
+    #                 conn.rollback()
+    #         except Exception:
+    #             pass
+    #         print(f"[DB Migration Error] {e}")
+    #     finally:
+    #         if conn:
+    #             conn.close()
 
     def execute_many_safe(self, sql, data, retries=3):
         if not data: return
@@ -78,6 +129,47 @@ class DBManager:
             return {row[0] for row in cursor.fetchall()}
         finally:
             if conn: conn.close()
+
+    def get_portfolio_last_crawled(self, symbol):
+        if not symbol:
+            return None
+        conn = None
+        try:
+            conn = self.get_conn()
+            cursor = conn.execute(
+                "SELECT Portfolio_Last_Crawled FROM User_Combinations WHERE Symbol = ?",
+                (symbol,),
+            )
+            row = cursor.fetchone()
+            return row[0] if row and row[0] else None
+        finally:
+            if conn:
+                conn.close()
+
+    def should_skip_portfolio(self, symbol, cache_hours):
+        last = self.get_portfolio_last_crawled(symbol)
+        if not last:
+            return False, None
+        try:
+            last_dt = datetime.strptime(last, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return False, last
+        cutoff = datetime.now() - timedelta(hours=cache_hours)
+        return last_dt >= cutoff, last
+
+    def get_comb_ids_by_symbols(self, symbols):
+        if not symbols:
+            return {}
+        placeholders = ",".join(["?"] * len(symbols))
+        sql = f"SELECT Comb_Id, Symbol FROM User_Combinations WHERE Symbol IN ({placeholders})"
+        conn = None
+        try:
+            conn = self.get_conn()
+            cursor = conn.execute(sql, tuple(symbols))
+            return {row[1]: row[0] for row in cursor.fetchall()}
+        finally:
+            if conn:
+                conn.close()
 
     def get_pending_tasks(self, table_name, limit=None):
         """获取待办任务，支持限制数量"""

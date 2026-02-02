@@ -60,6 +60,12 @@ class SpiderPortfolioMixin:
                 continue
         return results
 
+
+class PortfolioCrawler(SpiderPortfolioMixin):
+    def __init__(self, init_browser_fn=None):
+        # Keep signature compatible with main_spider; use internal browser for detail mining.
+        super().__init__()
+
     def _portfolio_status(self, symbol, tab):
         """获取组合关停状态"""
         status = {"is_closed": False}
@@ -76,6 +82,7 @@ class SpiderPortfolioMixin:
         return status
 
     def _mine_portfolio(self, symbol):
+        SpiderTools.safe_action(self.driver)
         """完整抓取函数：修正 JS 错误并防止字典覆盖"""
         # 初始化结果字典，确保数据不会丢失
         results = {
