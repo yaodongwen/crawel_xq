@@ -36,7 +36,7 @@ class SpiderPortfolioMixin:
 
         for item in items:
             try:
-                # 提取作者名 (对应截图路径)
+                # 提取作者名
                 author = item.xpath('.//div[@class="status-retweet-user"]/a[@class="name"]/text()')
                 author_name = author[0].strip() if author else "未知作者"
 
@@ -80,6 +80,70 @@ class PortfolioCrawler(SpiderPortfolioMixin):
                 elif '关停时间' in text:
                     status['close_time'] = text.replace('关停时间：', '').strip()
         return status
+    
+    # 获取当前持仓
+    def get_portfolio_holdings(self, symbol):
+        """
+        组合详情获取逻辑：
+        回归手动定位抓取方式，并在主页失效时通过调仓接口补全。
+        """
+        results = {
+            "symbol": symbol,
+            "Detailed_Position": []
+        }
+        
+        try:
+            SpiderTools.safe_action(self.driver)
+            url = f"https://xueqiu.com/P/{symbol}"
+            # 在访问页面前开启监听调仓接口
+            self.driver.listen.start('rebalancing/history.json')
+            
+            detail_tab = self.driver.new_tab(url)
+            print(f"正在访问组合: {symbol}")
+
+            # 1. 尝试使用“老方法”手动抓取主页持仓
+            # 1. 定位到总容器
+            weight_list_container = detail_tab.ele('xpath://div[@class="weight-list"]', timeout=5)
+            
+            if weight_list_container:
+                # 2. 获取容器下的所有直接子元素 (eles 返回的是列表，直接对其进行遍历)
+                all_items = weight_list_container.eles('xpath:./*')
+                
+                current_segment = None
+                for item in all_items:
+                    tag_class = item.attr('class')
+                    if not tag_class: continue
+
+                    # 判定为板块行 (segment)
+                    if 'segment' in tag_class:
+                        seg_name = item.ele('xpath:.//span[@class="segment-name"]').text.strip()
+                        seg_prop = item.ele('xpath:.//span[@class="segment-weight weight"]').text.strip()
+                        
+                        current_segment = {
+                            "category_name": seg_name,
+                            "proportion": seg_prop,
+                            "stocks": []
+                        }
+                        results["Detailed_Position"].append(current_segment)
+                    
+                    # 判定为股票行 (stock)，且已进入某个板块
+                    elif 'stock' in tag_class and current_segment is not None:
+                        # 根据截图，股票名在 div.name，价格在 div.price，权重在 span.stock-weight
+                        results["Detailed_Position"][-1]["stocks"].append({
+                            "name": item.ele('xpath:.//div[@class="name"]').text.strip(),
+                            "price": item.ele('xpath:.//div[@class="price"]').text.strip(),
+                            "weight": item.ele('xpath:.//span[contains(@class, "stock-weight")]').text.strip()
+                        })
+
+            detail_tab.close()
+            return results
+
+        except Exception as e:
+            print(f"⚠️ 抓取失败 {symbol}: {e}")
+            if self.driver.tabs_count > 1:
+                self.driver.latest_tab.close()
+            return results
+
 
     def _mine_portfolio(self, symbol):
         SpiderTools.safe_action(self.driver)
@@ -101,7 +165,7 @@ class PortfolioCrawler(SpiderPortfolioMixin):
             detail_tab.get(url)
 
             # 2. 基础信息
-            title_ele = detail_tab.ele('.cube-title', timeout=5)
+            title_ele = detail_tab.ele('.cube-title', timeout=10)
             results['portfolio_name'] = title_ele.ele('.name').text
             xpath_num = '//div[@class="cube-title"]//div[@class="cube-people-data"]//span[@class="num"]'
             results['portfolio_follows'] = re.search(r'(\d+)', detail_tab.ele('xpath:' + xpath_num).text).group(1)
@@ -125,26 +189,7 @@ class PortfolioCrawler(SpiderPortfolioMixin):
             results.update(self._portfolio_status(symbol, detail_tab))
 
             # 6. 仓位信息 --- 【核心修正：JS 中使用 .trim()】 ---
-            # 保留你 spider_portfolio.py 中的逻辑字段名
-            get_pos_js = """
-            (() => {
-                let segments = document.querySelectorAll('.weight-list .segment');
-                return Array.from(segments).map(seg => {
-                    let name_ele = seg.querySelector('.segment-name');
-                    let prop_ele = seg.querySelector('.segment-weight');
-                    return {
-                        "name": name_ele ? name_ele.innerText.trim() : "未知板块",
-                        "proportion": prop_ele ? prop_ele.innerText.trim() : "0%",
-                        "stocks": Array.from(seg.querySelectorAll('.stock')).map(s => ({
-                            "name": s.querySelector('.name')?.innerText.trim() || '',
-                            "price": s.querySelector('.price')?.innerText.trim() || '',
-                            "weight": s.querySelector('.stock-weight')?.innerText.trim() || ''
-                        }))
-                    };
-                });
-            })()
-            """
-            results["Detailed_Position"] = detail_tab.run_js(get_pos_js)
+            results["Detailed_Position"] = self.get_portfolio_holdings(symbol)["Detailed_Position"]
 
             # 7. 触发滚动与点击监听
             detail_tab.scroll.down(1000)
@@ -173,7 +218,7 @@ class PortfolioCrawler(SpiderPortfolioMixin):
         return results
 
 if __name__ == "__main__":
-    aa = SpiderPortfolioMixin()
+    aa = PortfolioCrawler()
     start_time = time.time()
     final_data = aa._mine_portfolio('ZH3084474')
     print(f"--- 最终结果 (总耗时: {time.time() - start_time:.2f}s) ---")

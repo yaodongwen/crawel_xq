@@ -117,7 +117,7 @@ class XueqiuSpider:
                         
                         row = (uid, u.get('screen_name'), u.get('status_count', 0),
                                u.get('friends_count', 0), u.get('followers_count', 0), 
-                               u.get('text', ''), now_str) 
+                               u.get('description', ''), now_str) 
                         new_users.append(row)
                         
                         if int(u.get('followers_count', 0)) > config.MIN_FOLLOWERS \
@@ -292,7 +292,9 @@ class XueqiuSpider:
                                     except Exception as e:
                                         print(f"error in get portfolio information: {e}")
                                         detail = None
-                                last_crawled_value = now_str if isinstance(detail, dict) else last_crawled
+                                detail_ok = isinstance(detail, dict)
+                                # Only update crawl time when detail is fetched successfully.
+                                last_crawled_value = now_str if detail_ok else last_crawled
 
                                 create_user_id = detail.get('create_user_id') if isinstance(detail, dict) else None
                                 if str(create_user_id).isdigit():
@@ -387,7 +389,7 @@ class XueqiuSpider:
                                         if not isinstance(seg, dict):
                                             print(f"seg type is {type(seg)}")
                                             continue
-                                        seg_name = seg.get('name')
+                                        seg_name = seg.get('category_name')
                                         seg_weight = seg.get('proportion')
                                         stocks = seg.get('stocks', [])
                                         if not isinstance(stocks, list) or not stocks:
@@ -529,12 +531,13 @@ class XueqiuSpider:
 
     def run(self):
         print(">>> 启动...")
-        ai_thread = threading.Thread(target=self.global_ai_worker, daemon=False)
+        ai_thread = threading.Thread(target=self.global_ai_worker, daemon=True)
         ai_thread.start()
         
         self.driver.get("https://xueqiu.com")
         print("\n" + "="*50); input(">>> 请扫码登录，完成后按【回车】..."); print("="*50 + "\n")
         
+        interrupted = False
         try:
             while True:
                 current_targets = self.db.get_target_count()
@@ -545,21 +548,24 @@ class XueqiuSpider:
                 ai_backlog = self.db.get_unanalyzed_count()
                 print(f"\n>>> [循环] 目标:{current_targets}/{config.TARGET_GOAL} | 用户库:{current_users}/{config.FOCUS_COUNT_LIMIT} | AI积压:{ai_backlog}")
                 
-                self.step3_batch_mine()   
-                self.step2_batch_filter() 
-                self.step1_batch_scan()   
+                self.step3_batch_mine()
+                self.step2_batch_filter()
+                self.step1_batch_scan()
                 time.sleep(2)
 
-        except KeyboardInterrupt: print("\n\n>>> 🛑 检测到用户中断 (Ctrl+C)...")
+        except KeyboardInterrupt:
+            interrupted = True
+            print("\n\n>>> 🛑 检测到用户中断 (Ctrl+C)...")
         except Exception as e: print(f"\n\n>>> ❌ 发生未捕获异常: {e}")
         finally:
             self.is_main_job_finished = True
-            left = self.db.get_unanalyzed_count()
-            while left > 0:
-                print(f">>> 提示: AI 线程还在处理剩余的 {left} 条数据...")
-                print(">>> 等待 AI 处理完成...")
-                ai_thread.join(timeout=20)  # 最多等 1 小时，防止卡死
+            if not interrupted:
                 left = self.db.get_unanalyzed_count()
+                while left > 0:
+                    print(f">>> 提示: AI 线程还在处理剩余的 {left} 条数据...")
+                    print(">>> 等待 AI 处理完成...")
+                    ai_thread.join(timeout=20)  # 最多等 1 小时，防止卡死
+                    left = self.db.get_unanalyzed_count()
             print(">>> 程序安全退出")
 
 if __name__ == '__main__':

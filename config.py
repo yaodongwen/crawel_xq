@@ -11,8 +11,8 @@ print(f">>> [Config] 数据库路径: {DB_PATH}")
 SEED_USER_URL = 'https://xueqiu.com/u/9887656769' 
 ARTICLE_COUNT_LIMIT = 20
 
-FOCUS_COUNT_LIMIT = 5
-TARGET_GOAL = 2
+FOCUS_COUNT_LIMIT = 30
+TARGET_GOAL = 5
 
 # === 【新增】流水线批次大小 ===
 # 意思是：Step 1 找到 10 个优质用户就停下来，转而去跑 Step 2
