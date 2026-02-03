@@ -69,7 +69,7 @@ class PortfolioCrawler(SpiderPortfolioMixin):
     def _portfolio_status(self, symbol, tab):
         """获取组合关停状态"""
         status = {"is_closed": False}
-        cube_closed = tab.ele('xpath://div[@class="cube-closed"]')
+        cube_closed = tab.ele('xpath://div[@class="cube-closed"]',timeout=0.5)
         if cube_closed:
             status["is_closed"] = True
             p_elements = cube_closed.eles('xpath:.//div[@class="text"]/p')
@@ -170,6 +170,7 @@ class PortfolioCrawler(SpiderPortfolioMixin):
             xpath_num = '//div[@class="cube-title"]//div[@class="cube-people-data"]//span[@class="num"]'
             results['portfolio_follows'] = re.search(r'(\d+)', detail_tab.ele('xpath:' + xpath_num).text).group(1)
 
+
             # 3. 盈利数据
             info_container = detail_tab.ele('#cube-info', timeout=5)
             per_spans = info_container.eles('.per')
@@ -184,7 +185,8 @@ class PortfolioCrawler(SpiderPortfolioMixin):
             results['create_user_id'] = creator.attr('href').strip('/').split('/')[-1]
             results['create_user_name'] = creator.ele('.name').text
             results['portfolio_description'] = detail_tab.ele('xpath://div[contains(@class, "cube-creator-info")]//div[@class="desc"]/span[@class="text"]').text
-
+            
+            
             # 5. 生存状态
             results.update(self._portfolio_status(symbol, detail_tab))
 
@@ -195,18 +197,18 @@ class PortfolioCrawler(SpiderPortfolioMixin):
             detail_tab.scroll.down(1000)
             history_btn = detail_tab.ele('xpath://a[@class="history"]')
             if history_btn:
-                history_btn.click(by_js=True)
+                history_btn.click(by_js=True) 
 
             # 8. 依次获取监听到的数据包
             # 捕获评论
             res_comm = detail_tab.listen.wait(timeout=5)
             if res_comm:
                 results["comments"] = self._parse_comments_fragment(res_comm.response.body)
-            
+
             # 捕获调仓 (按顺序读取队列)
             res_rebal = detail_tab.listen.wait(timeout=3)
             if res_rebal:
-                results["rebalances"] = SpiderTools.decode_response(res_rebal)
+                results["rebalances"] = SpiderTools.decode_response(res_rebal)          
 
             detail_tab.close()
 
@@ -221,5 +223,5 @@ if __name__ == "__main__":
     aa = PortfolioCrawler()
     start_time = time.time()
     final_data = aa._mine_portfolio('ZH3084474')
-    print(f"--- 最终结果 (总耗时: {time.time() - start_time:.2f}s) ---")
+    print(f"--- 最终结果 (总耗时: {time.time() - start_time}s) ---")
     print(json.dumps(final_data, ensure_ascii=False, indent=2))
