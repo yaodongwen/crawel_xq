@@ -140,4 +140,5 @@ SQL_CREATE_TABLES = [
     """CREATE INDEX IF NOT EXISTS idx_portfolio_txn_comb_time ON Portfolio_Transactions(Comb_Id, Transaction_Time);""",
     """CREATE INDEX IF NOT EXISTS idx_portfolio_comments_comb_time ON Portfolio_Comments(Comb_Id, Publish_Time);""",
     """CREATE INDEX IF NOT EXISTS idx_user_portfolio_follows_user ON User_Portfolio_Follows(User_Id);""",
+    """CREATE UNIQUE INDEX IF NOT EXISTS idx_portfolio_positions_unique ON Portfolio_Positions(Comb_Id, Segment_Name, Stock_Name, Stock_Price, Stock_Weight, Segment_Weight);""",
 ]

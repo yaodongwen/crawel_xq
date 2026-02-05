@@ -166,3 +166,10 @@ class AIWorker:
                 except Exception as e:
                     print(f"error in AI: {e}")
                     self._db.mark_raw_as_analyzed(sid, 2)
+
+
+def run_ai_process(stop_event):
+    from db_manager import DBManager
+    db = DBManager()
+    worker = AIWorker(db=db, is_main_job_finished_fn=lambda: stop_event.is_set())
+    worker.run()

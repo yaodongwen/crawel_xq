@@ -93,13 +93,13 @@ class PortfolioCrawler(SpiderPortfolioMixin):
         }
         
         try:
-            SpiderTools.safe_action(self.driver)
             url = f"https://xueqiu.com/P/{symbol}"
             # 在访问页面前开启监听调仓接口
             self.driver.listen.start('rebalancing/history.json')
             
             detail_tab = self.driver.new_tab(url)
             print(f"正在访问组合: {symbol}")
+            SpiderTools.safe_action(self.driver)
 
             # 1. 尝试使用“老方法”手动抓取主页持仓
             # 1. 定位到总容器
@@ -163,6 +163,7 @@ class PortfolioCrawler(SpiderPortfolioMixin):
             # 1. 启动监听器 (合并监听)
             detail_tab.listen.start(['cube/timeline', 'rebalancing/history.json'])
             detail_tab.get(url)
+            SpiderTools.safe_action(self.driver)
 
             # 2. 基础信息
             title_ele = detail_tab.ele('.cube-title', timeout=10)

@@ -2,11 +2,12 @@ from DrissionPage import ChromiumPage, ChromiumOptions
 import time
 import hashlib
 import threading
+import multiprocessing
 import os
 import config
 from db_manager import DBManager
 
-from spider_ai import AIWorker
+from spider_ai import AIWorker, run_ai_process
 from spider_comments import CommentsCrawler
 from spider_tools import SpiderTools
 from spider_portfolio import PortfolioCrawler
@@ -30,12 +31,14 @@ class XueqiuSpider:
         
         self.total_ai_saved = 0
         self.is_main_job_finished = False 
+        self.stop_event = threading.Event()
+        self.ai_stop_event = multiprocessing.Event()
         self._ai_worker = AIWorker(
             db=self.db,
             is_main_job_finished_fn=lambda: self.is_main_job_finished,
             on_saved=self._on_ai_saved,
         )
-        self._comments_crawler = CommentsCrawler(init_browser_fn=self._init_browser)
+        self._comments_crawler = CommentsCrawler(init_browser_fn=self._init_browser, stop_event=self.stop_event)
         self._portfolio_crawler = PortfolioCrawler(init_browser_fn=self._init_browser)
 
     def _init_browser(self):
@@ -60,6 +63,8 @@ class XueqiuSpider:
     # ================= Step 1: 批次扫描 =================
 
     def step1_batch_scan(self):
+        if self.stop_event.is_set():
+            return
         pending_hq = len(self.db.get_pending_tasks("High_quality_users", limit=config.PIPELINE_BATCH_SIZE * 5))
         if pending_hq >= config.PIPELINE_BATCH_SIZE * 5: return
 
@@ -87,7 +92,9 @@ class XueqiuSpider:
                 btn = tab.ele('tag:a@@href=#/follow', timeout=3)
                 if btn: btn.click()
                 else: 
-                    self.db.mark_user_as_scanned(current_source_id); return
+                    if not self.stop_event.is_set():
+                        self.db.mark_user_as_scanned(current_source_id)
+                    return
             
             tab.listen.start(config.API['FOCUS'])
             page_count = 0
@@ -98,7 +105,9 @@ class XueqiuSpider:
 
                 next_btn = tab.ele('.pagination__next', timeout=3)
                 if not next_btn or not next_btn.states.is_displayed: 
-                    self.db.mark_user_as_scanned(current_source_id); break
+                    if not self.stop_event.is_set():
+                        self.db.mark_user_as_scanned(current_source_id)
+                    break
                 
                 next_btn.click(by_js=True)
                 SpiderTools.random_sleep()
@@ -140,6 +149,8 @@ class XueqiuSpider:
     # ================= Step 2: 批次筛选 =================
 
     def step2_batch_filter(self):
+        if self.stop_event.is_set():
+            return
         pending = self.db.get_pending_tasks("High_quality_users", limit=config.PIPELINE_BATCH_SIZE)
         if not pending: return
 
@@ -150,10 +161,14 @@ class XueqiuSpider:
             uid, uname = row['User_Id'], row['User_Name']
             ai_left = self.db.get_unanalyzed_count()
             print(f"    Check: {uname} | AI待办: {ai_left}", end='\r')
+            stock_ok = False
+            portfolio_ok = False
 
             if uid in self.target_ids_cache:
                 # print("user in cache, continue!")
-                self.db.update_task_status(uid, "High_quality_users"); continue
+                if not self.stop_event.is_set():
+                    self.db.update_task_status(uid, "High_quality_users")
+                continue
             
             SpiderTools.safe_action(self.driver)
 
@@ -232,8 +247,8 @@ class XueqiuSpider:
                     tab.listen.stop()
                 except Exception:
                     print("error in stop listening quote")
-
-                self.db.update_task_status(uid, "High_quality_users")
+                if not self.stop_event.is_set():
+                    stock_ok = True
 
             # 组合
             try:
@@ -505,7 +520,7 @@ class XueqiuSpider:
                                 )
                             if position_rows:
                                 self.db.execute_many_safe(
-                                    "INSERT INTO Portfolio_Positions (Comb_Id, Segment_Name, Segment_Weight, Stock_Name, Stock_Price, Stock_Weight, Updated_At) VALUES (?,?,?,?,?,?,?)",
+                                    "INSERT OR IGNORE INTO Portfolio_Positions (Comb_Id, Segment_Name, Segment_Weight, Stock_Name, Stock_Price, Stock_Weight, Updated_At) VALUES (?,?,?,?,?,?,?)",
                                     position_rows,
                                 )
                             if rebalance_rows:
@@ -527,12 +542,17 @@ class XueqiuSpider:
                     tab.listen.stop()
                 except Exception:
                     print("error in stop listening portfolio")
+                if not self.stop_event.is_set():
+                    portfolio_ok = True
+
+            if not self.stop_event.is_set() and stock_ok and portfolio_ok:
+                self.db.update_task_status(uid, "High_quality_users")
 
 
     def run(self):
         print(">>> 启动...")
-        ai_thread = threading.Thread(target=self.global_ai_worker, daemon=True)
-        ai_thread.start()
+        ai_process = multiprocessing.Process(target=run_ai_process, args=(self.ai_stop_event,), daemon=True)
+        ai_process.start()
         
         self.driver.get("https://xueqiu.com")
         print("\n" + "="*50); input(">>> 请扫码登录，完成后按【回车】..."); print("="*50 + "\n")
@@ -555,16 +575,18 @@ class XueqiuSpider:
 
         except KeyboardInterrupt:
             interrupted = True
+            self.stop_event.set()
             print("\n\n>>> 🛑 检测到用户中断 (Ctrl+C)...")
         except Exception as e: print(f"\n\n>>> ❌ 发生未捕获异常: {e}")
         finally:
             self.is_main_job_finished = True
+            self.ai_stop_event.set()
             if not interrupted:
                 left = self.db.get_unanalyzed_count()
-                while left > 0:
+                while left > 0 and ai_process.is_alive():
                     print(f">>> 提示: AI 线程还在处理剩余的 {left} 条数据...")
                     print(">>> 等待 AI 处理完成...")
-                    ai_thread.join(timeout=20)  # 最多等 1 小时，防止卡死
+                    ai_process.join(timeout=20)
                     left = self.db.get_unanalyzed_count()
             print(">>> 程序安全退出")
 

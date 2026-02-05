@@ -224,6 +224,30 @@ class DBManager:
         finally:
             if conn: conn.close()
 
+    def get_user_comments_last_crawled(self, user_id):
+        if not user_id:
+            return None
+        conn = None
+        try:
+            conn = self.get_conn()
+            cursor = conn.execute(
+                "SELECT Value FROM System_Meta WHERE Key = ?",
+                (f"COMMENTS_LAST_CRAWLED_{user_id}",),
+            )
+            row = cursor.fetchone()
+            return row[0] if row and row[0] else None
+        finally:
+            if conn:
+                conn.close()
+
+    def set_user_comments_last_crawled(self, user_id, ts_str):
+        if not user_id or not ts_str:
+            return
+        self.execute_one_safe(
+            "INSERT OR REPLACE INTO System_Meta (Key, Value) VALUES (?, ?)",
+            (f"COMMENTS_LAST_CRAWLED_{user_id}", ts_str),
+        )
+
     # === 【新增】获取目标用户总数 ===
     def get_target_count(self):
         conn = None

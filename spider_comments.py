@@ -1,10 +1,12 @@
 import config
+from datetime import datetime
 from spider_tools import SpiderTools
 
 
 class CommentsCrawler:
-    def __init__(self, init_browser_fn):
+    def __init__(self, init_browser_fn, stop_event=None):
         self._init_browser_fn = init_browser_fn
+        self._stop_event = stop_event
 
     def _mine_long_articles(self, driver, uid, status_id):
         """
@@ -13,6 +15,8 @@ class CommentsCrawler:
         抓取完整标题和正文后返回。
         """
         try:
+            if self._stop_event and self._stop_event.is_set():
+                return None
             # 构造长文链接
             url = f"https://xueqiu.com/{uid}/{status_id}"
 
@@ -49,7 +53,18 @@ class CommentsCrawler:
                     driver.latest_tab.close()
             return None
 
+    @staticmethod
+    def _parse_time(ts_str):
+        if not ts_str:
+            return None
+        try:
+            return datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None
+
     def step3_batch_mine(self, driver, db):
+        if self._stop_event and self._stop_event.is_set():
+            return driver
         pending = db.get_pending_tasks("Target_users", limit=config.PIPELINE_BATCH_SIZE)
         if not pending:
             return driver
@@ -60,12 +75,19 @@ class CommentsCrawler:
         list_tab = driver.latest_tab
 
         for row in pending:
+            if self._stop_event and self._stop_event.is_set():
+                break
             uid, uname = row['User_Id'], row['User_Name']
             ai_left = db.get_unanalyzed_count()
             print(f"    User: {uname} | AI待办: {ai_left}")
 
             SpiderTools.safe_action(driver)
             try:
+                user_completed = False
+                last_crawled = db.get_user_comments_last_crawled(uid)
+                last_dt = self._parse_time(last_crawled)
+                newest_seen = None
+                reached_old = False
                 target_api = 'user_timeline.json'
                 list_tab.listen.start(target_api)
 
@@ -79,10 +101,17 @@ class CommentsCrawler:
                 # --- 定义内部函数：统一处理每一页的数据解析逻辑 ---
                 # 这样第一页和翻页后的代码不用写两遍
                 def process_page_data(response_data):
+                    nonlocal newest_seen, reached_old
                     rows = []
                     if response_data and 'statuses' in response_data:
                         for s in response_data['statuses']:
                             readable_time = SpiderTools.format_time(s['created_at'])
+                            created_dt = self._parse_time(readable_time)
+                            if created_dt and (newest_seen is None or created_dt > newest_seen):
+                                newest_seen = created_dt
+                            if last_dt and created_dt and created_dt <= last_dt:
+                                reached_old = True
+                                continue
 
                             # === 1. 尝试获取普通内容 ===
                             content = s.get('text', '')
@@ -130,6 +159,8 @@ class CommentsCrawler:
 
                 # --- 循环翻页直到达标 ---
                 while total_added < config.ARTICLE_COUNT_LIMIT:
+                    if self._stop_event and self._stop_event.is_set():
+                        break
                     if SpiderTools.has_slider(driver):
                         SpiderTools.safe_action(driver)
 
@@ -155,10 +186,17 @@ class CommentsCrawler:
                             break  # 没包
                     else:
                         break  # 没按钮了
+                    if reached_old:
+                        break
 
                 list_tab.listen.stop()
                 print(f"    -> 完成: {uname} (入库: {total_added})")
-                db.update_task_status(uid, "Target_users")
+                if not (self._stop_event and self._stop_event.is_set()):
+                    user_completed = True
+                if user_completed:
+                    db.update_task_status(uid, "Target_users")
+                    if newest_seen:
+                        db.set_user_comments_last_crawled(uid, newest_seen.strftime("%Y-%m-%d %H:%M:%S"))
 
             except Exception as e:
                 print(f"    ❌ 异常 [{uname}]: {e}")
@@ -169,4 +207,3 @@ class CommentsCrawler:
                     list_tab.listen.stop()
 
         return driver
-
