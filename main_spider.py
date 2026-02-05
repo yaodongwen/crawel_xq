@@ -43,8 +43,8 @@ class XueqiuSpider:
 
     def _init_browser(self):
         co = ChromiumOptions()
-        co.set_browser_path(config.MAC_CHROME_PATH)
-        co.set_user_data_path(config.USER_DATA_PATH)
+        co.set_browser_path(config.get_chrome_path())
+        co.set_user_data_path(config.get_user_data_path())
         co.set_local_port(9337) 
         co.set_argument('--ignore-certificate-errors')
         try: return ChromiumPage(co)

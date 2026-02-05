@@ -2,9 +2,32 @@ import os
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 数据库名保持不变
-DB_PATH = os.path.join(BASE_DIR, "xueqiu_pro_v3.db") 
-USER_DATA_PATH = os.path.join(BASE_DIR, "drission_userdata_pro")
-MAC_CHROME_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+DB_PATH = os.path.join(BASE_DIR, "xueqiu_pro_v3.db")
+
+# === 系统切换配置 ===
+# 可选: "mac" 或 "windows"
+OS_TYPE = "mac"
+
+# Chrome 路径（可按需修改）
+CHROME_PATHS = {
+    "mac": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "windows": r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    # 备用: r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+}
+
+# DrissionPage 用户数据目录（按系统拆分，避免互相覆盖）
+USER_DATA_PATHS = {
+    "mac": os.path.join(BASE_DIR, "drission_userdata_pro"),
+    "windows": os.path.join(BASE_DIR, "drission_userdata_pro_win"),
+}
+
+
+def get_chrome_path():
+    return CHROME_PATHS.get(OS_TYPE, CHROME_PATHS["mac"])
+
+
+def get_user_data_path():
+    return USER_DATA_PATHS.get(OS_TYPE, USER_DATA_PATHS["mac"])
 
 print(f">>> [Config] 数据库路径: {DB_PATH}")
 
