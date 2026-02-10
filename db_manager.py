@@ -1,150 +1,155 @@
-import sqlite3
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta
-from config import DB_PATH, SQL_CREATE_TABLES, CACHE_DAYS
+
+import config
+
+try:
+    import psycopg2
+    from psycopg2 import pool
+    from psycopg2.extras import RealDictCursor
+except Exception as e:  # pragma: no cover
+    raise RuntimeError(
+        "PostgreSQL backend requires psycopg2. Install dependencies via: pip install -r requirements.txt"
+    ) from e
+
 
 class DBManager:
     def __init__(self):
-        self.db_path = DB_PATH
+        # DSN format matches psycopg2.connect(**config) in test_db.py.
+        # Keep timeouts short to fail fast when host/pg_hba/password is wrong.
+        self._dsn = (
+            f"host={config.PG_HOST} port={config.PG_PORT} dbname={config.PG_DBNAME} "
+            f"user={config.PG_USER} password={config.PG_PASSWORD} connect_timeout=10"
+        )
+
+        self._verify_connection()
+
+        minc = int(getattr(config, "PG_POOL_MIN", 1))
+        maxc = int(getattr(config, "PG_POOL_MAX", 10))
+        if minc < 1:
+            minc = 1
+        if maxc < minc:
+            maxc = minc
+        self._pool = pool.ThreadedConnectionPool(minc, maxc, self._dsn)
+
         self.init_tables()
-        # self._migrate_user_portfolio_follows_symbol()
-        self._enable_wal()
 
-    def get_conn(self):
-        return sqlite3.connect(self.db_path, timeout=30)
+    def _verify_connection(self):
+        """Fail fast with a clear error message before pool initialization."""
+        safe = f"{config.PG_USER}@{config.PG_HOST}:{config.PG_PORT}/{config.PG_DBNAME}"
+        try:
+            conn = psycopg2.connect(self._dsn)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                    cur.fetchone()
+            finally:
+                conn.close()
+        except Exception as e:
+            raise RuntimeError(f"PostgreSQL connection failed: {safe} ({e})") from e
 
-    def _enable_wal(self):
+    @contextmanager
+    def _get_conn(self):
         conn = None
         try:
-            conn = self.get_conn()
-            conn.execute("PRAGMA journal_mode=WAL;")
-            conn.commit()
-        except: pass
+            conn = self._pool.getconn()
+            yield conn
         finally:
-            if conn: conn.close()
+            try:
+                if conn is not None:
+                    self._pool.putconn(conn)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _normalize_sql(sql: str) -> str:
+        """Best-effort adapter for legacy sqlite-style SQL."""
+        if not sql:
+            return sql
+        s = sql.strip()
+
+        # sqlite placeholders `?` -> psycopg2 placeholders `%s`
+        if "?" in s:
+            s = s.replace("?", "%s")
+
+        # sqlite `INSERT OR IGNORE` -> `INSERT ... ON CONFLICT DO NOTHING`
+        upper = s.upper()
+        if upper.startswith("INSERT OR IGNORE"):
+            s2 = "INSERT" + s[len("INSERT OR IGNORE") :]
+            if "ON CONFLICT" not in s2.upper():
+                if s2.endswith(";"):
+                    s2 = s2[:-1] + " ON CONFLICT DO NOTHING;"
+                else:
+                    s2 = s2 + " ON CONFLICT DO NOTHING"
+            s = s2
+        return s
 
     def init_tables(self):
-        conn = None
         try:
-            conn = self.get_conn()
-            for sql in SQL_CREATE_TABLES: conn.execute(sql)
-            conn.commit()
-        except Exception as e: print(f"[DB Init Error] {e}")
-        finally:
-            if conn: conn.close()
-
-    # def _migrate_user_portfolio_follows_symbol(self):
-    #     """Switch User_Portfolio_Follows from Comb_Id to Symbol if needed."""
-    #     conn = None
-    #     try:
-    #         conn = self.get_conn()
-    #         cursor = conn.execute(
-    #             "SELECT name FROM sqlite_master WHERE type='table' AND name='User_Portfolio_Follows'"
-    #         )
-    #         if cursor.fetchone() is None:
-    #             return
-    #         cols = [r[1] for r in conn.execute("PRAGMA table_info(User_Portfolio_Follows)").fetchall()]
-    #         if 'Symbol' in cols:
-    #             return
-
-    #         conn.execute("DROP TABLE IF EXISTS User_Portfolio_Follows_new;")
-    #         conn.execute(
-    #             """
-    #             CREATE TABLE IF NOT EXISTS User_Portfolio_Follows_new (
-    #                 User_Id INTEGER NOT NULL,
-    #                 Symbol TEXT NOT NULL,
-    #                 Build_Or_Collection INTEGER,
-    #                 Follow_Time TEXT,
-    #                 PRIMARY KEY (User_Id, Symbol),
-    #                 FOREIGN KEY (User_Id) REFERENCES users(User_Id),
-    #                 FOREIGN KEY (Symbol) REFERENCES User_Combinations(Symbol)
-    #             );
-    #             """
-    #         )
-    #         conn.execute(
-    #             """
-    #             INSERT OR IGNORE INTO User_Portfolio_Follows_new (User_Id, Symbol, Build_Or_Collection, Follow_Time)
-    #             SELECT f.User_Id, c.Symbol, f.Build_Or_Collection, f.Follow_Time
-    #             FROM User_Portfolio_Follows f
-    #             JOIN User_Combinations c ON c.Comb_Id = f.Comb_Id;
-    #             """
-    #         )
-    #         conn.execute("DROP TABLE User_Portfolio_Follows;")
-    #         conn.execute("ALTER TABLE User_Portfolio_Follows_new RENAME TO User_Portfolio_Follows;")
-    #         conn.commit()
-    #     except Exception as e:
-    #         try:
-    #             if conn:
-    #                 conn.rollback()
-    #         except Exception:
-    #             pass
-    #         print(f"[DB Migration Error] {e}")
-    #     finally:
-    #         if conn:
-    #             conn.close()
+            with self._get_conn() as conn:
+                with conn:
+                    with conn.cursor() as cur:
+                        for ddl in config.SQL_CREATE_TABLES:
+                            cur.execute(ddl)
+        except Exception as e:
+            raise RuntimeError(f"[DB Init Error] {e}") from e
 
     def execute_many_safe(self, sql, data, retries=3):
-        if not data: return
-        for attempt in range(retries):
-            conn = None
+        if not data:
+            return
+        sql = self._normalize_sql(sql)
+        for attempt in range(int(retries)):
             try:
-                conn = self.get_conn()
-                with conn: conn.executemany(sql, data)
+                with self._get_conn() as conn:
+                    with conn:
+                        with conn.cursor() as cur:
+                            cur.executemany(sql, data)
                 return
-            except sqlite3.OperationalError as e:
-                if "locked" in str(e): time.sleep(1)
-                else: break
-            finally:
-                if conn: conn.close()
+            except (psycopg2.errors.DeadlockDetected, psycopg2.errors.SerializationFailure):
+                if attempt >= retries - 1:
+                    raise
+                time.sleep(0.5 * (attempt + 1))
 
     def execute_one_safe(self, sql, params=(), retries=3):
-        for attempt in range(retries):
-            conn = None
+        sql = self._normalize_sql(sql)
+        for attempt in range(int(retries)):
             try:
-                conn = self.get_conn()
-                with conn: conn.execute(sql, params)
+                with self._get_conn() as conn:
+                    with conn:
+                        with conn.cursor() as cur:
+                            cur.execute(sql, params)
                 return
-            except sqlite3.OperationalError as e:
-                if "locked" in str(e): time.sleep(1)
-                else: 
-                    print("error in execute sql: {e}")
-                    break
-            finally:
-                if conn: conn.close()
+            except (psycopg2.errors.DeadlockDetected, psycopg2.errors.SerializationFailure):
+                if attempt >= retries - 1:
+                    raise
+                time.sleep(0.5 * (attempt + 1))
+            except Exception as e:
+                raise RuntimeError(f"DB execute failed: {e}\nSQL: {sql}") from e
 
     def get_existing_user_ids(self):
-        conn = None
-        try:
-            conn = self.get_conn()
-            cursor = conn.execute("SELECT User_Id FROM users")
-            return {row[0] for row in cursor.fetchall()}
-        finally:
-            if conn: conn.close()
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT User_Id FROM users")
+                return {row[0] for row in cur.fetchall()}
 
     def get_existing_target_ids(self):
-        conn = None
-        try:
-            conn = self.get_conn()
-            cursor = conn.execute("SELECT User_Id FROM Target_users")
-            return {row[0] for row in cursor.fetchall()}
-        finally:
-            if conn: conn.close()
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT User_Id FROM Target_users")
+                return {row[0] for row in cur.fetchall()}
 
     def get_portfolio_last_crawled(self, symbol):
         if not symbol:
             return None
-        conn = None
-        try:
-            conn = self.get_conn()
-            cursor = conn.execute(
-                "SELECT Portfolio_Last_Crawled FROM User_Combinations WHERE Symbol = ?",
-                (symbol,),
-            )
-            row = cursor.fetchone()
-            return row[0] if row and row[0] else None
-        finally:
-            if conn:
-                conn.close()
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT Portfolio_Last_Crawled FROM User_Combinations WHERE Symbol = %s",
+                    (symbol,),
+                )
+                row = cur.fetchone()
+                return row[0] if row and row[0] else None
 
     def should_skip_portfolio(self, symbol, cache_hours):
         last = self.get_portfolio_last_crawled(symbol)
@@ -160,177 +165,142 @@ class DBManager:
     def get_comb_ids_by_symbols(self, symbols):
         if not symbols:
             return {}
-        placeholders = ",".join(["?"] * len(symbols))
+        placeholders = ",".join(["%s"] * len(symbols))
         sql = f"SELECT Comb_Id, Symbol FROM User_Combinations WHERE Symbol IN ({placeholders})"
-        conn = None
-        try:
-            conn = self.get_conn()
-            cursor = conn.execute(sql, tuple(symbols))
-            return {row[1]: row[0] for row in cursor.fetchall()}
-        finally:
-            if conn:
-                conn.close()
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, tuple(symbols))
+                return {row[1]: row[0] for row in cur.fetchall()}
 
     def get_pending_tasks(self, table_name, limit=None):
-        """获取待办任务，支持限制数量"""
-        cutoff = (datetime.now() - timedelta(days=CACHE_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
-        
-        # 基础 SQL
-        sql = f"SELECT * FROM {table_name} WHERE Last_Updated IS NULL OR Last_Updated < ?"
-        
-        # 如果指定了 limit，拼接到 SQL 后面
+        cutoff = (datetime.now() - timedelta(days=config.CACHE_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+
+        sql = f"SELECT * FROM {table_name} WHERE Last_Updated IS NULL OR Last_Updated < %s"
+        params = [cutoff]
         if limit:
-            sql += f" LIMIT {limit}"
-            
-        conn = None
-        try:
-            conn = self.get_conn()
-            conn.row_factory = sqlite3.Row
-            cursor = conn.execute(sql, (cutoff,))
-            return cursor.fetchall()
-        finally:
-            if conn: conn.close()
+            sql += " LIMIT %s"
+            params.append(int(limit))
+
+        with self._get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, tuple(params))
+                return cur.fetchall()
 
     def update_task_status(self, user_id, table_name):
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.execute_one_safe(f"UPDATE {table_name} SET Last_Updated = ? WHERE User_Id = ?", (now, user_id))
+        self.execute_one_safe(
+            f"UPDATE {table_name} SET Last_Updated = %s WHERE User_Id = %s",
+            (now, user_id),
+        )
 
     def check_seed_scanned(self, seed_id):
-        return False 
+        return False
 
     def mark_seed_scanned(self, seed_id):
         pass
 
     def get_unanalyzed_raw_data(self, limit=50):
-        sql = "SELECT * FROM Raw_Statuses WHERE Is_Analyzed = 0 LIMIT ?"
-        conn = None
-        try:
-            conn = self.get_conn()
-            conn.row_factory = sqlite3.Row
-            cursor = conn.execute(sql, (limit,))
-            return cursor.fetchall()
-        finally:
-            if conn: conn.close()
+        sql = "SELECT * FROM Raw_Statuses WHERE Is_Analyzed = 0 LIMIT %s"
+        with self._get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, (int(limit),))
+                return cur.fetchall()
 
     def mark_raw_as_analyzed(self, status_id, status_code=1):
-        self.execute_one_safe("UPDATE Raw_Statuses SET Is_Analyzed = ? WHERE Status_Id = ?", (status_code, status_id))
+        self.execute_one_safe(
+            "UPDATE Raw_Statuses SET Is_Analyzed = %s WHERE Status_Id = %s",
+            (status_code, status_id),
+        )
 
     def get_unanalyzed_count(self):
-        conn = None
-        try:
-            conn = self.get_conn()
-            cursor = conn.execute("SELECT count(*) FROM Raw_Statuses WHERE Is_Analyzed = 0")
-            return cursor.fetchone()[0]
-        finally:
-            if conn: conn.close()
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT count(*) FROM Raw_Statuses WHERE Is_Analyzed = 0")
+                return cur.fetchone()[0]
 
     def get_user_comments_last_crawled(self, user_id):
         if not user_id:
             return None
-        conn = None
-        try:
-            conn = self.get_conn()
-            cursor = conn.execute(
-                "SELECT Value FROM System_Meta WHERE Key = ?",
-                (f"COMMENTS_LAST_CRAWLED_{user_id}",),
-            )
-            row = cursor.fetchone()
-            return row[0] if row and row[0] else None
-        finally:
-            if conn:
-                conn.close()
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT Value FROM System_Meta WHERE Key = %s",
+                    (f"COMMENTS_LAST_CRAWLED_{user_id}",),
+                )
+                row = cur.fetchone()
+                return row[0] if row and row[0] else None
 
     def set_user_comments_last_crawled(self, user_id, ts_str):
         if not user_id or not ts_str:
             return
         self.execute_one_safe(
-            "INSERT OR REPLACE INTO System_Meta (Key, Value) VALUES (?, ?)",
+            """
+            INSERT INTO System_Meta (Key, Value)
+            VALUES (%s, %s)
+            ON CONFLICT (Key) DO UPDATE SET Value = EXCLUDED.Value
+            """,
             (f"COMMENTS_LAST_CRAWLED_{user_id}", ts_str),
         )
 
-    # === 【新增】获取目标用户总数 ===
     def get_target_count(self):
-        conn = None
-        try:
-            conn = self.get_conn()
-            cursor = conn.execute("SELECT count(*) FROM Target_users")
-            return cursor.fetchone()[0]
-        finally:
-            if conn: conn.close()
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT count(*) FROM Target_users")
+                return cur.fetchone()[0]
 
-    # === 新增：裂变扫描状态管理 ===
-    
     def get_next_source_user(self):
-        """
-        从 High_quality_users 表中找一个【没扫过关注列表】的用户作为新的种子。
-        优先找粉丝多的，质量可能更高。
-        """
-        # 排除掉已经在 System_Meta 里标记为 SCANNED_FOLLOWERS_xxx 的用户
         sql = """
-            SELECT User_Id, User_Name FROM High_quality_users 
+            SELECT User_Id, User_Name FROM High_quality_users
             WHERE User_Id NOT IN (
-                SELECT replace(Key, 'SCANNED_FOLLOWERS_', '') 
-                FROM System_Meta 
+                SELECT replace(Key, 'SCANNED_FOLLOWERS_', '')
+                FROM System_Meta
                 WHERE Key LIKE 'SCANNED_FOLLOWERS_%'
             )
             ORDER BY Followers_Count DESC
             LIMIT 1
         """
-        conn = None
-        try:
-            conn = self.get_conn()
-            conn.row_factory = sqlite3.Row
-            cursor = conn.execute(sql)
-            return cursor.fetchone() # 返回 (User_Id, User_Name) 或者 None
-        finally:
-            if conn: conn.close()
+        with self._get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql)
+                return cur.fetchone()
 
     def mark_user_as_scanned(self, user_id):
-        """标记该用户的关注列表已扫完"""
         self.execute_one_safe(
-            "INSERT OR REPLACE INTO System_Meta (Key, Value) VALUES (?, ?)", 
-            (f"SCANNED_FOLLOWERS_{user_id}", datetime.now().strftime("%Y-%m-%d"))
+            """
+            INSERT INTO System_Meta (Key, Value)
+            VALUES (%s, %s)
+            ON CONFLICT (Key) DO UPDATE SET Value = EXCLUDED.Value
+            """,
+            (f"SCANNED_FOLLOWERS_{user_id}", datetime.now().strftime("%Y-%m-%d")),
         )
 
-
     def is_user_scanned(self, user_id):
-        """检查某用户的关注列表是否已标记为扫描完成"""
-        sql = "SELECT Value FROM System_Meta WHERE Key = ?"
-        conn = None
-        try:
-            conn = self.get_conn()
-            cursor = conn.execute(sql, (f"SCANNED_FOLLOWERS_{user_id}",))
-            return cursor.fetchone() is not None
-        finally:
-            if conn: conn.close()
+        sql = "SELECT 1 FROM System_Meta WHERE Key = %s"
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (f"SCANNED_FOLLOWERS_{user_id}",))
+                return cur.fetchone() is not None
 
-
-    # === 【新增】统计专用方法 ===
-    
     def get_total_users_count(self):
-        """统计总共扫描入库了多少用户"""
-        conn = None
-        try:
-            conn = self.get_conn()
-            cursor = conn.execute("SELECT count(*) FROM users")
-            return cursor.fetchone()[0]
-        finally:
-            if conn: conn.close()
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT count(*) FROM users")
+                return cur.fetchone()[0]
 
     def get_total_comments_count(self):
-        """统计 AI 一共入库了多少条高价值评论"""
-        conn = None
-        try:
-            conn = self.get_conn()
-            cursor = conn.execute("SELECT count(*) FROM Value_Comments")
-            return cursor.fetchone()[0]
-        finally:
-            if conn: conn.close()
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT count(*) FROM Value_Comments")
+                return cur.fetchone()[0]
 
     def get_db_size(self):
-        """(可选) 获取数据库文件大小 MB"""
-        import os
+        """Return database size in MB (best-effort)."""
         try:
-            size = os.path.getsize(self.db_path)
-            return round(size / (1024 * 1024), 2)
-        except: return 0
+            with self._get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT pg_database_size(%s)", (config.PG_DBNAME,))
+                    size = cur.fetchone()[0]
+            return round(float(size) / (1024 * 1024), 2)
+        except Exception:
+            return 0
+

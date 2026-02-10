@@ -42,7 +42,7 @@ class SpiderAIMixin:
                 continue
 
             for row in raw_batch:
-                sid, content = row['Status_Id'], row['Description']
+                sid, content = row["status_id"], row["description"]
                 clean = re.sub(r'<[^>]+>', '', content).strip().replace('\n', ' ')
 
                 if len(clean) < 10:
@@ -72,9 +72,24 @@ class SpiderAIMixin:
 
                     final_cat = cat if valuable else f"[低价值]-{cat}"
                     self.db.execute_one_safe(
-                        "INSERT OR IGNORE INTO Value_Comments VALUES (?,?,?,?,?,?,?,?,?)",
-                        (sid, row['User_Id'], row['Description'], row['Created_At'], row['Stock_Tags'],
-                         final_cat, row['Forward'], row['Comment_Count'], row['Like'])
+                        """
+                        INSERT INTO Value_Comments (
+                            Comment_Id, User_Id, Content, Publish_Time, Mentioned_Stocks,
+                            Category, Forward, Comment_Count, Like_Count
+                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (Comment_Id) DO NOTHING
+                        """,
+                        (
+                            sid,
+                            row["user_id"],
+                            row["description"],
+                            row["created_at"],
+                            row["stock_tags"],
+                            final_cat,
+                            row["forward"],
+                            row["comment_count"],
+                            row["like_count"],
+                        ),
                     )
 
                     if valuable:
@@ -121,7 +136,7 @@ class AIWorker:
                 continue
 
             for row in raw_batch:
-                sid, content = row['Status_Id'], row['Description']
+                sid, content = row["status_id"], row["description"]
                 clean = re.sub(r'<[^>]+>', '', content).strip().replace('\n', ' ')
 
                 if len(clean) < 10:
@@ -151,9 +166,24 @@ class AIWorker:
 
                     final_cat = cat if valuable else f"[低价值]-{cat}"
                     self._db.execute_one_safe(
-                        "INSERT OR IGNORE INTO Value_Comments VALUES (?,?,?,?,?,?,?,?,?)",
-                        (sid, row['User_Id'], row['Description'], row['Created_At'], row['Stock_Tags'],
-                         final_cat, row['Forward'], row['Comment_Count'], row['Like'])
+                        """
+                        INSERT INTO Value_Comments (
+                            Comment_Id, User_Id, Content, Publish_Time, Mentioned_Stocks,
+                            Category, Forward, Comment_Count, Like_Count
+                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (Comment_Id) DO NOTHING
+                        """,
+                        (
+                            sid,
+                            row["user_id"],
+                            row["description"],
+                            row["created_at"],
+                            row["stock_tags"],
+                            final_cat,
+                            row["forward"],
+                            row["comment_count"],
+                            row["like_count"],
+                        ),
                     )
 
                     if valuable:

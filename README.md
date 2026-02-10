@@ -11,6 +11,7 @@ pip install -r requirements.txt
 修改 `config.py`：
 - `OS_TYPE = "mac"` 或 `"windows"`
 - 如有需要，更新 `CHROME_PATHS` 和 `USER_DATA_PATHS`
+- PostgreSQL 连接信息：`PG_HOST` / `PG_PORT` / `PG_DBNAME` / `PG_USER` / `PG_PASSWORD`
 
 ### 3) 启动
 为清理残余进程，先运行：

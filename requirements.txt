@@ -1,3 +1,4 @@
 DrissionPage>=4.1.1.2
 lxml>=4.9.0
 ollama>=0.3.0
+psycopg2-binary>=2.9.9

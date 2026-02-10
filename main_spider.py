@@ -16,7 +16,11 @@ from spider_portfolio import PortfolioCrawler
 class XueqiuSpider:
     def __init__(self):
         print(">>> [系统] 正在清理残留进程...")
-        os.system("pkill -f 'Google Chrome'") 
+        # Windows doesn't have pkill; use taskkill instead.
+        if getattr(config, "OS_TYPE", "").lower() == "windows":
+            os.system('taskkill /F /IM chrome.exe /T >NUL 2>&1')
+        else:
+            os.system("pkill -f 'Google Chrome'")
         time.sleep(2) 
 
         print(">>> 初始化数据库...")
@@ -78,8 +82,8 @@ class XueqiuSpider:
         if not current_source_id:
             next_user = self.db.get_next_source_user()
             if not next_user: print(">>> 无可用宿主"); return
-            current_source_id = next_user['User_Id']
-            print(f">>> 切换宿主: {next_user['User_Name']}")
+            current_source_id = next_user["user_id"]
+            print(f">>> 切换宿主: {next_user['user_name']}")
         else: print(f">>> 继续宿主: {current_source_id}")
 
         tab = self.driver.latest_tab
@@ -135,8 +139,26 @@ class XueqiuSpider:
                             new_hq.append(tuple(hq_row))
                             new_hq_added_in_this_batch += 1
                     
-                    if new_users: self.db.execute_many_safe("INSERT OR IGNORE INTO users VALUES (?,?,?,?,?,?,?)", new_users)
-                    if new_hq: self.db.execute_many_safe("INSERT OR IGNORE INTO High_quality_users VALUES (?,?,?,?,?,?,?)", new_hq)
+                    if new_users:
+                        self.db.execute_many_safe(
+                            """
+                            INSERT INTO users (
+                                User_Id, User_Name, Comments_Count, Friends_Count, Followers_Count, Description, Last_Updated
+                            ) VALUES (%s,%s,%s,%s,%s,%s,%s)
+                            ON CONFLICT (User_Id) DO NOTHING
+                            """,
+                            new_users,
+                        )
+                    if new_hq:
+                        self.db.execute_many_safe(
+                            """
+                            INSERT INTO High_quality_users (
+                                User_Id, User_Name, Comments_Count, Friends_Count, Followers_Count, Description, Last_Updated
+                            ) VALUES (%s,%s,%s,%s,%s,%s,%s)
+                            ON CONFLICT (User_Id) DO NOTHING
+                            """,
+                            new_hq,
+                        )
                     print(f"    [扫描] 本轮新增优质: {new_hq_added_in_this_batch}/{config.PIPELINE_BATCH_SIZE}", end='\r')
 
                 page_count += 1
@@ -158,7 +180,7 @@ class XueqiuSpider:
         tab = self.driver.latest_tab
         
         for row in pending:
-            uid, uname = row['User_Id'], row['User_Name']
+            uid, uname = row["user_id"], row["user_name"]
             ai_left = self.db.get_unanalyzed_count()
             print(f"    Check: {uname} | AI待办: {ai_left}", end='\r')
             stock_ok = False
@@ -233,11 +255,42 @@ class XueqiuSpider:
                                     elif len(symbol)==5 and symbol.isdigit(): market = 'HK'; has_waipan = True
                                     elif '.' not in symbol and len(symbol)<5: market = 'US'; has_waipan = True
                                     stock_list.append((uid, s.get('name',''), symbol, float(s.get('current',0) or 0), float(s.get('percent',0) or 0), market, now_str))
-                                if stock_list: self.db.execute_many_safe("INSERT OR REPLACE INTO User_Stocks (User_Id, Stock_Name, Stock_Symbol, Current_Price, Percent, Market, Updated_At) VALUES (?,?,?,?,?,?,?)", stock_list)
+                                if stock_list:
+                                    self.db.execute_many_safe(
+                                        """
+                                        INSERT INTO User_Stocks (
+                                            User_Id, Stock_Name, Stock_Symbol, Current_Price, Percent, Market, Updated_At
+                                        ) VALUES (%s,%s,%s,%s,%s,%s,%s)
+                                        ON CONFLICT (User_Id, Stock_Symbol) DO UPDATE SET
+                                            Stock_Name = EXCLUDED.Stock_Name,
+                                            Current_Price = EXCLUDED.Current_Price,
+                                            Percent = EXCLUDED.Percent,
+                                            Market = EXCLUDED.Market,
+                                            Updated_At = EXCLUDED.Updated_At
+                                        """,
+                                        stock_list,
+                                    )
 
                     if has_agu and has_waipan:
-                        target_data = list(row); target_data[-1] = None # Step 3 待办
-                        self.db.execute_one_safe("INSERT OR IGNORE INTO Target_users VALUES (?,?,?,?,?,?,?)", tuple(target_data))
+                        # `row` is a PostgreSQL dict row; build values explicitly (don't use list(row) which yields keys).
+                        target_data = (
+                            uid,
+                            uname,
+                            row.get("comments_count", 0),
+                            row.get("friends_count", 0),
+                            row.get("followers_count", 0),
+                            row.get("description", ""),
+                            None,
+                        )
+                        self.db.execute_one_safe(
+                            """
+                            INSERT INTO Target_users (
+                                User_Id, User_Name, Comments_Count, Friends_Count, Followers_Count, Description, Last_Updated
+                            ) VALUES (%s,%s,%s,%s,%s,%s,%s)
+                            ON CONFLICT (User_Id) DO NOTHING
+                            """,
+                            target_data,
+                        )
                         self.target_ids_cache.add(uid)
             except Exception as e:
                 print(f"error in step2:{e}")
@@ -375,12 +428,18 @@ class XueqiuSpider:
 
                             if comb_rows:
                                 self.db.execute_many_safe(
-                                    "INSERT OR IGNORE INTO User_Combinations (User_Id, Symbol, Name, Net_Value, Total_Gain, Monthly_Gain, Daily_Gain, Create_Time, Updated_At, Portfolio_Last_Crawled, Close_At_Time, Description, Is_Public) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                                    """
+                                    INSERT INTO User_Combinations (
+                                        User_Id, Symbol, Name, Net_Value, Total_Gain, Monthly_Gain, Daily_Gain,
+                                        Create_Time, Updated_At, Portfolio_Last_Crawled, Close_At_Time, Description, Is_Public
+                                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                                    ON CONFLICT (Symbol) DO NOTHING
+                                    """,
                                     comb_rows,
                                 )
                             if update_rows:
                                 self.db.execute_many_safe(
-                                    "UPDATE User_Combinations SET User_Id=?, Name=?, Net_Value=?, Total_Gain=?, Monthly_Gain=?, Daily_Gain=?, Create_Time=?, Updated_At=?, Portfolio_Last_Crawled=?, Close_At_Time=?, Description=?, Is_Public=? WHERE Symbol=?",
+                                    "UPDATE User_Combinations SET User_Id=%s, Name=%s, Net_Value=%s, Total_Gain=%s, Monthly_Gain=%s, Daily_Gain=%s, Create_Time=%s, Updated_At=%s, Portfolio_Last_Crawled=%s, Close_At_Time=%s, Description=%s, Is_Public=%s WHERE Symbol=%s",
                                     update_rows,
                                 )
 
@@ -515,22 +574,42 @@ class XueqiuSpider:
 
                             if follow_rows:
                                 self.db.execute_many_safe(
-                                    "INSERT OR IGNORE INTO User_Portfolio_Follows (User_Id, Symbol, Build_Or_Collection, Follow_Time) VALUES (?,?,?,?)",
+                                    """
+                                    INSERT INTO User_Portfolio_Follows (User_Id, Symbol, Build_Or_Collection, Follow_Time)
+                                    VALUES (%s,%s,%s,%s)
+                                    ON CONFLICT (User_Id, Symbol) DO NOTHING
+                                    """,
                                     follow_rows,
                                 )
                             if position_rows:
                                 self.db.execute_many_safe(
-                                    "INSERT OR IGNORE INTO Portfolio_Positions (Comb_Id, Segment_Name, Segment_Weight, Stock_Name, Stock_Price, Stock_Weight, Updated_At) VALUES (?,?,?,?,?,?,?)",
+                                    """
+                                    INSERT INTO Portfolio_Positions (
+                                        Comb_Id, Segment_Name, Segment_Weight, Stock_Name, Stock_Price, Stock_Weight, Updated_At
+                                    ) VALUES (%s,%s,%s,%s,%s,%s,%s)
+                                    ON CONFLICT DO NOTHING
+                                    """,
                                     position_rows,
                                 )
                             if rebalance_rows:
                                 self.db.execute_many_safe(
-                                    "INSERT OR IGNORE INTO Portfolio_Transactions (Comb_Id, Stock_Symbol, Stock_Name, Prev_Weight, Target_Weight, Price, Cash_Value, Status, Transaction_Time, Notes) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                                    """
+                                    INSERT INTO Portfolio_Transactions (
+                                        Comb_Id, Stock_Symbol, Stock_Name, Prev_Weight, Target_Weight,
+                                        Price, Cash_Value, Status, Transaction_Time, Notes
+                                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                                    ON CONFLICT DO NOTHING
+                                    """,
                                     rebalance_rows,
                                 )
                             if comment_rows:
                                 self.db.execute_many_safe(
-                                    "INSERT OR IGNORE INTO Portfolio_Comments (Status_Id, Comb_Id, User_Id, Content, Publish_Time, Like_Count, Reply_Count, Forward_Count) VALUES (?,?,?,?,?,?,?,?)",
+                                    """
+                                    INSERT INTO Portfolio_Comments (
+                                        Status_Id, Comb_Id, User_Id, Content, Publish_Time, Like_Count, Reply_Count, Forward_Count
+                                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                                    ON CONFLICT (Status_Id) DO NOTHING
+                                    """,
                                     comment_rows,
                                 )
 

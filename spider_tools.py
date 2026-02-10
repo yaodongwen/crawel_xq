@@ -5,6 +5,8 @@ import random
 import time
 from datetime import datetime
 
+import config
+
 
 class SpiderTools:
     """Utilities shared across spiders.
@@ -37,7 +39,16 @@ class SpiderTools:
     def has_slider(driver):
         try:
             tab = driver.latest_tab
-            return tab.ele('#aliyunCaptcha-sliding-slider', timeout=0.1) or tab.ele('text:访问验证', timeout=0.1)
+            # Old Aliyun slider id + a few common texts on xueqiu risk-control pages.
+            return (
+                tab.ele('#aliyunCaptcha-sliding-slider', timeout=0.1)
+                or tab.ele('xpath://*[@id="aliyunCaptcha-sliding-slider"]', timeout=0.1)
+                or tab.ele('xpath://iframe[contains(@src,"captcha") or contains(@src,"Captcha")]', timeout=0.1)
+                or tab.ele('text:访问验证', timeout=0.1)
+                or tab.ele('text:安全验证', timeout=0.1)
+                or tab.ele('text:请完成验证', timeout=0.1)
+                or tab.ele('text:滑动验证', timeout=0.1)
+            )
         except Exception:
             return False
 
@@ -85,7 +96,10 @@ class SpiderTools:
             driver.quit()
         except Exception:
             pass
-        os.system("pkill -f 'Google Chrome'")
+        if getattr(config, "OS_TYPE", "").lower() == "windows":
+            os.system('taskkill /F /IM chrome.exe /T >NUL 2>&1')
+        else:
+            os.system("pkill -f 'Google Chrome'")
         time.sleep(2)
         return init_browser_fn()
 

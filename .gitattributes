@@ -1,0 +1,7 @@
+# 强制文本文件使用 LF
+* text=auto eol=lf
+
+# 或更明确地指定
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf

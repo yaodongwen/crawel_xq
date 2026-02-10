@@ -1,5 +1,6 @@
 import config
 from datetime import datetime
+import time
 from spider_tools import SpiderTools
 
 
@@ -7,6 +8,40 @@ class CommentsCrawler:
     def __init__(self, init_browser_fn, stop_event=None):
         self._init_browser_fn = init_browser_fn
         self._stop_event = stop_event
+
+    def _try_fetch_status_via_api(self, driver, status_id):
+        """Prefer JSON API over HTML long-article page to reduce risk-control triggers."""
+        api_tab = None
+        try:
+            api_url = f"https://xueqiu.com/statuses/show.json?id={status_id}"
+            api_tab = driver.new_tab()
+            api_tab.listen.start("statuses/show.json")
+            api_tab.get(api_url)
+            SpiderTools.safe_action(driver)
+
+            res = api_tab.listen.wait(timeout=5)
+            payload = SpiderTools.decode_response(res)
+            if not payload:
+                return None
+
+            if isinstance(payload, dict):
+                status = payload.get("status") or payload.get("data") or payload
+                if isinstance(status, dict):
+                    return status
+            return None
+        except Exception:
+            return None
+        finally:
+            try:
+                if api_tab:
+                    api_tab.listen.stop()
+            except Exception:
+                pass
+            try:
+                if api_tab:
+                    api_tab.close()
+            except Exception:
+                pass
 
     def _mine_long_articles(self, driver, uid, status_id):
         """
@@ -17,11 +52,28 @@ class CommentsCrawler:
         try:
             if self._stop_event and self._stop_event.is_set():
                 return None
+
+            # 0) Try JSON API first (usually avoids slider)
+            status = self._try_fetch_status_via_api(driver, status_id)
+            if isinstance(status, dict):
+                title = (status.get("title") or "").strip()
+                body = status.get("text") or status.get("description") or ""
+                body = str(body).strip()
+                if title or body:
+                    if title:
+                        return f"【长文标题】{title}\n{body}".strip()
+                    return body
             # 构造长文链接
             url = f"https://xueqiu.com/{uid}/{status_id}"
 
             # 打开新标签页 (DrissionPage 会自动切换焦点到新页面)
             detail_tab = driver.new_tab(url)
+            # 长文页更容易触发风控/滑块；先处理滑块再去找正文元素
+            SpiderTools.safe_action(driver)
+            if SpiderTools.has_slider(driver):
+                # 不做人工介入：直接跳过当前长文，避免卡死主流程
+                detail_tab.close()
+                return None
 
             # 等待核心元素加载 (标题或正文)
             # 给 5 秒超时，防止页面加载太慢卡住
@@ -77,7 +129,7 @@ class CommentsCrawler:
         for row in pending:
             if self._stop_event and self._stop_event.is_set():
                 break
-            uid, uname = row['User_Id'], row['User_Name']
+            uid, uname = row["user_id"], row["user_name"]
             ai_left = db.get_unanalyzed_count()
             print(f"    User: {uname} | AI待办: {ai_left}")
 
@@ -149,7 +201,13 @@ class CommentsCrawler:
                     raw_rows = process_page_data(data)
                     if raw_rows:
                         db.execute_many_safe(
-                            "INSERT OR IGNORE INTO Raw_Statuses (Status_Id, User_Id, Description, Created_At, Stock_Tags, Is_Analyzed, Forward, Comment_Count, Like) VALUES (?,?,?,?,?,?,?,?,?)",
+                            """
+                            INSERT INTO Raw_Statuses (
+                                Status_Id, User_Id, Description, Created_At, Stock_Tags, Is_Analyzed,
+                                Forward, Comment_Count, Like_Count
+                            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                            ON CONFLICT (Status_Id) DO NOTHING
+                            """,
                             raw_rows,
                         )
                         total_added += len(raw_rows)
@@ -176,7 +234,13 @@ class CommentsCrawler:
                             raw_rows = process_page_data(data)
                             if raw_rows:
                                 db.execute_many_safe(
-                                    "INSERT OR IGNORE INTO Raw_Statuses (Status_Id, User_Id, Description, Created_At, Stock_Tags, Is_Analyzed, Forward, Comment_Count, Like) VALUES (?,?,?,?,?,?,?,?,?)",
+                                    """
+                                    INSERT INTO Raw_Statuses (
+                                        Status_Id, User_Id, Description, Created_At, Stock_Tags, Is_Analyzed,
+                                        Forward, Comment_Count, Like_Count
+                                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                                    ON CONFLICT (Status_Id) DO NOTHING
+                                    """,
                                     raw_rows,
                                 )
                                 total_added += len(raw_rows)

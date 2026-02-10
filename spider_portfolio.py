@@ -66,10 +66,58 @@ class PortfolioCrawler(SpiderPortfolioMixin):
         # Keep signature compatible with main_spider; use internal browser for detail mining.
         super().__init__()
 
+    @staticmethod
+    def _first_nonempty_line(text):
+        if not text:
+            return None
+        for line in str(text).splitlines():
+            s = line.strip()
+            if s:
+                return s
+        return None
+
+    @staticmethod
+    def _clean_title(title):
+        """Normalize browser title as a fallback for portfolio name extraction."""
+        if not title:
+            return None
+        t = str(title).strip()
+        # Common suffix on xueqiu pages
+        for suf in (" - 雪球", "- 雪球"):
+            if t.endswith(suf):
+                t = t[: -len(suf)].strip()
+        return t or None
+
+    def _try_ele(self, root, locator, timeout=2):
+        """DrissionPage.ele() raises when not found; treat it as optional."""
+        if not root:
+            return None
+        try:
+            return root.ele(locator, timeout=timeout)
+        except Exception:
+            return None
+
+    def _try_text(self, root, locator, timeout=2):
+        el = self._try_ele(root, locator, timeout=timeout)
+        try:
+            if not el:
+                return None
+            s = (el.text or "").strip()
+            return s or None
+        except Exception:
+            return None
+
+    def _try_text_any(self, root, locators, timeout=2):
+        for loc in locators:
+            s = self._try_text(root, loc, timeout=timeout)
+            if s:
+                return s
+        return None
+
     def _portfolio_status(self, symbol, tab):
         """获取组合关停状态"""
         status = {"is_closed": False}
-        cube_closed = tab.ele('xpath://div[@class="cube-closed"]',timeout=0.5)
+        cube_closed = tab.ele('xpath://div[contains(@class, "cube-closed")]',timeout=0.5)
         if cube_closed:
             status["is_closed"] = True
             p_elements = cube_closed.eles('xpath:.//div[@class="text"]/p')
@@ -103,7 +151,7 @@ class PortfolioCrawler(SpiderPortfolioMixin):
 
             # 1. 尝试使用“老方法”手动抓取主页持仓
             # 1. 定位到总容器
-            weight_list_container = detail_tab.ele('xpath://div[@class="weight-list"]', timeout=5)
+            weight_list_container = self._try_ele(detail_tab, 'xpath://div[contains(@class, "weight-list")]', timeout=5)
             
             if weight_list_container:
                 # 2. 获取容器下的所有直接子元素 (eles 返回的是列表，直接对其进行遍历)
@@ -116,8 +164,8 @@ class PortfolioCrawler(SpiderPortfolioMixin):
 
                     # 判定为板块行 (segment)
                     if 'segment' in tag_class:
-                        seg_name = item.ele('xpath:.//span[@class="segment-name"]').text.strip()
-                        seg_prop = item.ele('xpath:.//span[@class="segment-weight weight"]').text.strip()
+                        seg_name = self._try_text(item, 'xpath:.//span[contains(@class, "segment-name")]', timeout=1) or ''
+                        seg_prop = self._try_text(item, 'xpath:.//span[contains(@class, "segment-weight") and contains(@class, "weight")]', timeout=1) or ''
                         
                         current_segment = {
                             "category_name": seg_name,
@@ -130,9 +178,9 @@ class PortfolioCrawler(SpiderPortfolioMixin):
                     elif 'stock' in tag_class and current_segment is not None:
                         # 根据截图，股票名在 div.name，价格在 div.price，权重在 span.stock-weight
                         results["Detailed_Position"][-1]["stocks"].append({
-                            "name": item.ele('xpath:.//div[@class="name"]').text.strip(),
-                            "price": item.ele('xpath:.//div[@class="price"]').text.strip(),
-                            "weight": item.ele('xpath:.//span[contains(@class, "stock-weight")]').text.strip()
+                            "name": self._try_text(item, 'xpath:.//div[contains(@class, "name")]', timeout=1) or "",
+                            "price": self._try_text(item, 'xpath:.//div[contains(@class, "price")]', timeout=1) or "",
+                            "weight": self._try_text(item, 'xpath:.//span[contains(@class, "stock-weight")]', timeout=1) or ""
                         })
 
             detail_tab.close()
@@ -166,15 +214,29 @@ class PortfolioCrawler(SpiderPortfolioMixin):
             SpiderTools.safe_action(self.driver)
 
             # 2. 基础信息
-            title_ele = detail_tab.ele('.cube-title', timeout=10)
-            results['portfolio_name'] = title_ele.ele('.name').text
-            xpath_num = '//div[@class="cube-title"]//div[@class="cube-people-data"]//span[@class="num"]'
-            results['portfolio_follows'] = re.search(r'(\d+)', detail_tab.ele('xpath:' + xpath_num).text).group(1)
+            title_ele = self._try_ele(detail_tab, '.cube-title', timeout=10)
+            results['portfolio_name'] = (
+                self._try_text_any(
+                    title_ele,
+                    ['.name', 'tag:h1', 'xpath:.//*[contains(@class, "name") or contains(@class, "title")]'],
+                    timeout=1,
+                )
+                or self._first_nonempty_line(getattr(title_ele, 'text', '') if title_ele else '')
+                or self._clean_title(detail_tab.title)
+            )
+
+            follows_raw = self._try_text(
+                detail_tab,
+                'xpath://div[contains(@class, "cube-title")]//div[contains(@class, "cube-people-data")]//span[contains(@class, "num")]',
+                timeout=3,
+            )
+            m = re.search(r'(\d+)', follows_raw or '')
+            results['portfolio_follows'] = m.group(1) if m else None
 
 
             # 3. 盈利数据
-            info_container = detail_tab.ele('#cube-info', timeout=5)
-            per_spans = info_container.eles('.per')
+            info_container = self._try_ele(detail_tab, '#cube-info', timeout=5)
+            per_spans = info_container.eles('.per') if info_container else []
             labels = ["Total_Return_Percentage", "Daily_Return_Percentage", "Monthly_Return_Percentage", 
                       "Net_Worth", "Total_Revenue_Ranking_Exceeds"]
             for i, span in enumerate(per_spans):
@@ -182,10 +244,18 @@ class PortfolioCrawler(SpiderPortfolioMixin):
                     results[labels[i]] = span.text.strip()
 
             # 4. 用户信息
-            creator = detail_tab.ele('xpath://div[contains(@class, "cube-creator-info")]//a[contains(@class, "creator")]')
-            results['create_user_id'] = creator.attr('href').strip('/').split('/')[-1]
-            results['create_user_name'] = creator.ele('.name').text
-            results['portfolio_description'] = detail_tab.ele('xpath://div[contains(@class, "cube-creator-info")]//div[@class="desc"]/span[@class="text"]').text
+            creator = self._try_ele(detail_tab, 'xpath://div[contains(@class, "cube-creator-info")]//a[contains(@class, "creator")]', timeout=5)
+            href = creator.attr('href') if creator else ''
+            results['create_user_id'] = href.strip('/').split('/')[-1] if href else None
+            results['create_user_name'] = (
+                self._try_text_any(creator, ['.name', 'xpath:.//*[contains(@class, "name")]'], timeout=1)
+                or self._first_nonempty_line(getattr(creator, 'text', '') if creator else '')
+            )
+            results['portfolio_description'] = self._try_text(
+                detail_tab,
+                'xpath://div[contains(@class, "cube-creator-info")]//div[contains(@class, "desc")]//span[contains(@class, "text")]',
+                timeout=3,
+            )
             
             
             # 5. 生存状态

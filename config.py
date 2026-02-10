@@ -4,9 +4,22 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 数据库名保持不变
 DB_PATH = os.path.join(BASE_DIR, "xueqiu_pro_v3.db")
 
+# === Database (PostgreSQL) ===
+# 由于数据量巨大/需要并行写入，推荐使用 PostgreSQL 替代 sqlite。
+# 注意：不要在日志里打印密码。
+PG_HOST = "192.168.1.33"
+PG_PORT = 5432
+PG_DBNAME = "postgres"
+PG_USER = "dwyao"
+PG_PASSWORD = "123123"
+
+# 连接池大小（并发抓取/AI 进程会用到多连接）
+PG_POOL_MIN = 1
+PG_POOL_MAX = 10
+
 # === 系统切换配置 ===
 # 可选: "mac" 或 "windows"
-OS_TYPE = "mac"
+OS_TYPE = "windows"
 
 # Chrome 路径（可按需修改）
 CHROME_PATHS = {
@@ -29,17 +42,22 @@ def get_chrome_path():
 def get_user_data_path():
     return USER_DATA_PATHS.get(OS_TYPE, USER_DATA_PATHS["mac"])
 
-print(f">>> [Config] 数据库路径: {DB_PATH}")
+print(f">>> [Config] PostgreSQL: {PG_USER}@{PG_HOST}:{PG_PORT}/{PG_DBNAME}")
 
 SEED_USER_URL = 'https://xueqiu.com/u/9887656769' 
-ARTICLE_COUNT_LIMIT = 20
 
-FOCUS_COUNT_LIMIT = 30
+# TEST
+ARTICLE_COUNT_LIMIT = 5
+FOCUS_COUNT_LIMIT = 20
 TARGET_GOAL = 5
+PIPELINE_BATCH_SIZE = 2
 
-# === 【新增】流水线批次大小 ===
-# 意思是：Step 1 找到 10 个优质用户就停下来，转而去跑 Step 2
-PIPELINE_BATCH_SIZE = 1
+# ARTICLE_COUNT_LIMIT = 3000
+# FOCUS_COUNT_LIMIT = 300000
+# TARGET_GOAL = 10000
+
+## === 【新增】流水线批次大小 ===
+# PIPELINE_BATCH_SIZE = 10 # 意思是：Step 1 找到 10 个优质用户就停下来，转而去跑 Step 2
 
 CACHE_DAYS = 21           
 AI_MODEL_NAME = "qwen2.5:1.5b" 
@@ -63,75 +81,115 @@ API = {
 }
 
 SQL_CREATE_TABLES = [
-    """CREATE TABLE IF NOT EXISTS System_Meta (Key TEXT PRIMARY KEY, Value TEXT);""",
-    """CREATE TABLE IF NOT EXISTS users (
-        User_Id INTEGER PRIMARY KEY, User_Name TEXT, Comments_Count INTEGER, 
-        Friends_Count INTEGER, Followers_Count INTEGER, Description TEXT, Last_Updated TEXT
-    );""",
-    """CREATE TABLE IF NOT EXISTS High_quality_users (
-        User_Id INTEGER PRIMARY KEY, User_Name TEXT, Comments_Count INTEGER, 
-        Friends_Count INTEGER, Followers_Count INTEGER, Description TEXT, Last_Updated TEXT
-    );""",
-    """CREATE TABLE IF NOT EXISTS Target_users (
-        User_Id INTEGER PRIMARY KEY, User_Name TEXT, Comments_Count INTEGER, 
-        Friends_Count INTEGER, Followers_Count INTEGER, Description TEXT, Last_Updated TEXT
-    );""",
-    """CREATE TABLE IF NOT EXISTS Raw_Statuses (
-        Status_Id INTEGER PRIMARY KEY, User_Id INTEGER, Description TEXT, 
-        Created_At TEXT, Stock_Tags TEXT, Is_Analyzed INTEGER DEFAULT 0,
-        Forward INTEGER, Comment_Count INTEGER, Like INTEGER
-    );""",
-    """CREATE TABLE IF NOT EXISTS Value_Comments (
-        Comment_Id INTEGER PRIMARY KEY, User_Id INTEGER, Content TEXT, 
-        Publish_Time TEXT, Mentioned_Stocks TEXT, Category TEXT, Forward INTEGER,
-        Comment_Count INTEGER, Like INTEGER
-    );""",
-    """CREATE TABLE IF NOT EXISTS User_Stocks (
-        Record_Id INTEGER PRIMARY KEY AUTOINCREMENT,
-        User_Id INTEGER,
+    # PostgreSQL schema (compatible with existing SQL identifiers)
+    """    CREATE TABLE IF NOT EXISTS System_Meta (
+        Key TEXT PRIMARY KEY,
+        Value TEXT
+    );
+    """,
+    """    CREATE TABLE IF NOT EXISTS users (
+        User_Id BIGINT PRIMARY KEY,
+        User_Name TEXT,
+        Comments_Count INTEGER,
+        Friends_Count INTEGER,
+        Followers_Count INTEGER,
+        Description TEXT,
+        Last_Updated TEXT
+    );
+    """,
+    """    CREATE TABLE IF NOT EXISTS High_quality_users (
+        User_Id BIGINT PRIMARY KEY,
+        User_Name TEXT,
+        Comments_Count INTEGER,
+        Friends_Count INTEGER,
+        Followers_Count INTEGER,
+        Description TEXT,
+        Last_Updated TEXT
+    );
+    """,
+    """    CREATE TABLE IF NOT EXISTS Target_users (
+        User_Id BIGINT PRIMARY KEY,
+        User_Name TEXT,
+        Comments_Count INTEGER,
+        Friends_Count INTEGER,
+        Followers_Count INTEGER,
+        Description TEXT,
+        Last_Updated TEXT
+    );
+    """,
+    """    CREATE TABLE IF NOT EXISTS Raw_Statuses (
+        Status_Id BIGINT PRIMARY KEY,
+        User_Id BIGINT,
+        Description TEXT,
+        Created_At TEXT,
+        Stock_Tags TEXT,
+        Is_Analyzed INTEGER DEFAULT 0,
+        Forward INTEGER,
+        Comment_Count INTEGER,
+        Like_Count INTEGER
+    );
+    """,
+    """    CREATE TABLE IF NOT EXISTS Value_Comments (
+        Comment_Id BIGINT PRIMARY KEY,
+        User_Id BIGINT,
+        Content TEXT,
+        Publish_Time TEXT,
+        Mentioned_Stocks TEXT,
+        Category TEXT,
+        Forward INTEGER,
+        Comment_Count INTEGER,
+        Like_Count INTEGER
+    );
+    """,
+    """    CREATE TABLE IF NOT EXISTS User_Stocks (
+        Record_Id BIGSERIAL PRIMARY KEY,
+        User_Id BIGINT,
         Stock_Name TEXT,
         Stock_Symbol TEXT,
-        Current_Price REAL,
-        Percent REAL, 
+        Current_Price DOUBLE PRECISION,
+        Percent DOUBLE PRECISION,
         Market TEXT,
         Updated_At TEXT,
-        UNIQUE(User_Id, Stock_Symbol) ON CONFLICT REPLACE
-    );""",
-    """CREATE TABLE IF NOT EXISTS User_Combinations (
-        Comb_Id INTEGER PRIMARY KEY AUTOINCREMENT,
-        User_Id INTEGER, -- 创建者 User_Id（可能需要后续补全）
-        Symbol TEXT NOT NULL UNIQUE, -- 雪球组合代码，如 ZH123456，全局唯一
+        UNIQUE(User_Id, Stock_Symbol)
+    );
+    """,
+    """    CREATE TABLE IF NOT EXISTS User_Combinations (
+        Comb_Id BIGSERIAL PRIMARY KEY,
+        User_Id BIGINT,
+        Symbol TEXT NOT NULL UNIQUE,
         Name TEXT,
-        Net_Value REAL, -- 最新净值
-        Total_Gain REAL, -- 总收益（%）
-        Monthly_Gain REAL, -- 月收益（%）
-        Daily_Gain REAL, -- 日收益（%）
-        Create_Time TEXT, -- 组合创建时间（可能需要后续补全）
-        Updated_At TEXT, -- 最后更新时间（来自雪球/爬虫抓取时间）
-        Portfolio_Last_Crawled TEXT, -- 上次抓取“组合详情”(调仓/动态)的时间，用于缓存/增量更新
-        Close_At_Time TEXT, -- 关闭时间；NULL/0 表示未关闭
+        Net_Value DOUBLE PRECISION,
+        Total_Gain DOUBLE PRECISION,
+        Monthly_Gain DOUBLE PRECISION,
+        Daily_Gain DOUBLE PRECISION,
+        Create_Time TEXT,
+        Updated_At TEXT,
+        Portfolio_Last_Crawled TEXT,
+        Close_At_Time TEXT,
         Description TEXT,
         Is_Public INTEGER DEFAULT 1
-    );""",
-    """CREATE TABLE IF NOT EXISTS Portfolio_Transactions (
-        Txn_Id INTEGER PRIMARY KEY AUTOINCREMENT,
-        Comb_Id INTEGER NOT NULL,
+    );
+    """,
+    """    CREATE TABLE IF NOT EXISTS Portfolio_Transactions (
+        Txn_Id BIGSERIAL PRIMARY KEY,
+        Comb_Id BIGINT NOT NULL,
         Stock_Symbol TEXT NOT NULL,
         Stock_Name TEXT,
-        Prev_Weight REAL, -- 调仓前权重（%）
-        Target_Weight REAL, -- 调仓后权重（%）
-        Price REAL, -- 调仓价格（若接口返回）
-        Cash_Value REAL, -- 调仓后现金比例/现金值（若接口返回）
-        Status TEXT, -- 调仓状态字段（若接口返回）
-        Transaction_Time TEXT NOT NULL, -- 调仓发生时间（精确到秒）
+        Prev_Weight DOUBLE PRECISION,
+        Target_Weight DOUBLE PRECISION,
+        Price DOUBLE PRECISION,
+        Cash_Value DOUBLE PRECISION,
+        Status TEXT,
+        Transaction_Time TEXT NOT NULL,
         Notes TEXT,
         FOREIGN KEY (Comb_Id) REFERENCES User_Combinations(Comb_Id),
         UNIQUE(Comb_Id, Transaction_Time, Stock_Symbol)
-    );""",
-    """CREATE TABLE IF NOT EXISTS Portfolio_Comments (
-        Status_Id INTEGER PRIMARY KEY, -- 使用雪球动态 id 做主键防重
-        Comb_Id INTEGER NOT NULL,
-        User_Id INTEGER,
+    );
+    """,
+    """    CREATE TABLE IF NOT EXISTS Portfolio_Comments (
+        Status_Id BIGINT PRIMARY KEY,
+        Comb_Id BIGINT NOT NULL,
+        User_Id BIGINT,
         Content TEXT NOT NULL,
         Publish_Time TEXT NOT NULL,
         Like_Count INTEGER DEFAULT 0,
@@ -139,10 +197,11 @@ SQL_CREATE_TABLES = [
         Forward_Count INTEGER DEFAULT 0,
         FOREIGN KEY (Comb_Id) REFERENCES User_Combinations(Comb_Id),
         FOREIGN KEY (User_Id) REFERENCES users(User_Id)
-    );""",
-    """CREATE TABLE IF NOT EXISTS Portfolio_Positions (
-        Pos_Id INTEGER PRIMARY KEY AUTOINCREMENT,
-        Comb_Id INTEGER NOT NULL,
+    );
+    """,
+    """    CREATE TABLE IF NOT EXISTS Portfolio_Positions (
+        Pos_Id BIGSERIAL PRIMARY KEY,
+        Comb_Id BIGINT NOT NULL,
         Segment_Name TEXT,
         Segment_Weight TEXT,
         Stock_Name TEXT,
@@ -150,18 +209,21 @@ SQL_CREATE_TABLES = [
         Stock_Weight TEXT,
         Updated_At TEXT,
         FOREIGN KEY (Comb_Id) REFERENCES User_Combinations(Comb_Id)
-    );""",
-    """CREATE TABLE IF NOT EXISTS User_Portfolio_Follows (
-        User_Id INTEGER NOT NULL,
-        Symbol TEXT NOT NULL, -- 组合唯一编码，如 ZH123456
-        Build_Or_Collection INTEGER, -- 如果是0就是用户自建的，为1则为用户收藏的组合
+    );
+    """,
+    """    CREATE TABLE IF NOT EXISTS User_Portfolio_Follows (
+        User_Id BIGINT NOT NULL,
+        Symbol TEXT NOT NULL,
+        Build_Or_Collection INTEGER,
         Follow_Time TEXT,
         PRIMARY KEY (User_Id, Symbol),
         FOREIGN KEY (User_Id) REFERENCES users(User_Id),
         FOREIGN KEY (Symbol) REFERENCES User_Combinations(Symbol)
-    );""",
-    """CREATE INDEX IF NOT EXISTS idx_portfolio_txn_comb_time ON Portfolio_Transactions(Comb_Id, Transaction_Time);""",
-    """CREATE INDEX IF NOT EXISTS idx_portfolio_comments_comb_time ON Portfolio_Comments(Comb_Id, Publish_Time);""",
-    """CREATE INDEX IF NOT EXISTS idx_user_portfolio_follows_user ON User_Portfolio_Follows(User_Id);""",
-    """CREATE UNIQUE INDEX IF NOT EXISTS idx_portfolio_positions_unique ON Portfolio_Positions(Comb_Id, Segment_Name, Stock_Name, Stock_Price, Stock_Weight, Segment_Weight);""",
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_portfolio_txn_comb_time ON Portfolio_Transactions(Comb_Id, Transaction_Time);",
+    "CREATE INDEX IF NOT EXISTS idx_portfolio_comments_comb_time ON Portfolio_Comments(Comb_Id, Publish_Time);",
+    "CREATE INDEX IF NOT EXISTS idx_user_portfolio_follows_user ON User_Portfolio_Follows(User_Id);",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_portfolio_positions_unique ON Portfolio_Positions(Comb_Id, Segment_Name, Stock_Name, Stock_Price, Stock_Weight, Segment_Weight);",
 ]
+
