@@ -60,7 +60,18 @@ PIPELINE_BATCH_SIZE = 2
 # PIPELINE_BATCH_SIZE = 10 # 意思是：Step 1 找到 10 个优质用户就停下来，转而去跑 Step 2
 
 CACHE_DAYS = 21           
-AI_MODEL_NAME = "qwen2.5:1.5b" 
+# AI_MODEL_NAME = "qwen2.5:1.5b" 
+
+# === AI 情绪因子模型配置 ===
+# 预处理股票别名字典（本地 JSON）
+STOCK_ALIASES_JSON = os.path.join(BASE_DIR, "data", "ultimate_stock_aliases.json")
+
+# 意图分类器（0/1）与情绪回归模型（0-10 分）
+INTENT_MODEL_PATH = os.path.join(BASE_DIR, "train_models", "model_intent_classifier_best")
+SENTIMENT_MODEL_PATH = os.path.join(BASE_DIR, "train_models", "model_finbert_regression")
+
+# AI 处理批次（从 Raw_Statuses 一次取多少条做推理）
+AI_BATCH_SIZE = 8
 
 # 大V的门槛
 MIN_FOLLOWERS = 5000
@@ -130,15 +141,16 @@ SQL_CREATE_TABLES = [
     );
     """,
     """    CREATE TABLE IF NOT EXISTS Value_Comments (
-        Comment_Id BIGINT PRIMARY KEY,
+        Comment_Id BIGINT NOT NULL,
         User_Id BIGINT,
-        Sentiment_Score REAL,
+        Mentioned_Stocks TEXT NOT NULL,
+        Sentiment_Score DOUBLE PRECISION,
         Publish_Time TEXT,
-        Mentioned_Stocks TEXT,
         Category TEXT,
         Forward INTEGER,
         Comment_Count INTEGER,
-        Like_Count INTEGER
+        Like_Count INTEGER,
+        PRIMARY KEY (Comment_Id, Mentioned_Stocks)
     );
     """,
     """    CREATE TABLE IF NOT EXISTS User_Stocks (
@@ -226,4 +238,3 @@ SQL_CREATE_TABLES = [
     "CREATE INDEX IF NOT EXISTS idx_user_portfolio_follows_user ON User_Portfolio_Follows(User_Id);",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_portfolio_positions_unique ON Portfolio_Positions(Comb_Id, Segment_Name, Stock_Name, Stock_Price, Stock_Weight, Segment_Weight);",
 ]
-

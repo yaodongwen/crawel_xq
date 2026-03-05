@@ -62,29 +62,6 @@ class DBManager:
             except Exception:
                 pass
 
-    @staticmethod
-    def _normalize_sql(sql: str) -> str:
-        """Best-effort adapter for legacy sqlite-style SQL."""
-        if not sql:
-            return sql
-        s = sql.strip()
-
-        # sqlite placeholders `?` -> psycopg2 placeholders `%s`
-        if "?" in s:
-            s = s.replace("?", "%s")
-
-        # sqlite `INSERT OR IGNORE` -> `INSERT ... ON CONFLICT DO NOTHING`
-        upper = s.upper()
-        if upper.startswith("INSERT OR IGNORE"):
-            s2 = "INSERT" + s[len("INSERT OR IGNORE") :]
-            if "ON CONFLICT" not in s2.upper():
-                if s2.endswith(";"):
-                    s2 = s2[:-1] + " ON CONFLICT DO NOTHING;"
-                else:
-                    s2 = s2 + " ON CONFLICT DO NOTHING"
-            s = s2
-        return s
-
     def init_tables(self):
         try:
             with self._get_conn() as conn:
@@ -98,7 +75,6 @@ class DBManager:
     def execute_many_safe(self, sql, data, retries=3):
         if not data:
             return
-        sql = self._normalize_sql(sql)
         for attempt in range(int(retries)):
             try:
                 with self._get_conn() as conn:
@@ -112,7 +88,6 @@ class DBManager:
                 time.sleep(0.5 * (attempt + 1))
 
     def execute_one_safe(self, sql, params=(), retries=3):
-        sql = self._normalize_sql(sql)
         for attempt in range(int(retries)):
             try:
                 with self._get_conn() as conn:
@@ -192,12 +167,6 @@ class DBManager:
             f"UPDATE {table_name} SET Last_Updated = %s WHERE User_Id = %s",
             (now, user_id),
         )
-
-    def check_seed_scanned(self, seed_id):
-        return False
-
-    def mark_seed_scanned(self, seed_id):
-        pass
 
     def get_unanalyzed_raw_data(self, limit=50):
         sql = "SELECT * FROM Raw_Statuses WHERE Is_Analyzed = 0 LIMIT %s"
@@ -286,21 +255,3 @@ class DBManager:
             with conn.cursor() as cur:
                 cur.execute("SELECT count(*) FROM users")
                 return cur.fetchone()[0]
-
-    def get_total_comments_count(self):
-        with self._get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT count(*) FROM Value_Comments")
-                return cur.fetchone()[0]
-
-    def get_db_size(self):
-        """Return database size in MB (best-effort)."""
-        try:
-            with self._get_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT pg_database_size(%s)", (config.PG_DBNAME,))
-                    size = cur.fetchone()[0]
-            return round(float(size) / (1024 * 1024), 2)
-        except Exception:
-            return 0
-

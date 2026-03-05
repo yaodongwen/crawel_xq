@@ -542,35 +542,35 @@ class XueqiuSpider:
                                         )
 
                                 # Comments -> Portfolio_Comments
-                                comments = detail.get('comments') if isinstance(detail.get('comments'), list) else []
-                                for c in comments:
-                                    if not isinstance(c, dict):
-                                        continue
-                                    author = c.get('author', '')
-                                    content = c.get('text', '') or ''
-                                    likes = c.get('likes', '0')
-                                    replies = c.get('comments_count', '0')
-                                    try:
-                                        like_count = int(likes)
-                                    except Exception:
-                                        like_count = 0
-                                    try:
-                                        reply_count = int(replies)
-                                    except Exception:
-                                        reply_count = 0
-                                    status_id = int(hashlib.md5(f"{symbol}|{author}|{content}|{like_count}|{reply_count}".encode('utf-8')).hexdigest()[:15], 16)
-                                    comment_rows.append(
-                                        (
-                                            status_id,
-                                            comb_id,
-                                            None,
-                                            content,
-                                            now_str,
-                                            like_count,
-                                            reply_count,
-                                            0,
-                                        )
-                                    )
+                                # comments = detail.get('comments') if isinstance(detail.get('comments'), list) else []
+                                # for c in comments:
+                                #     if not isinstance(c, dict):
+                                #         continue
+                                #     author = c.get('author', '')
+                                #     content = c.get('text', '') or ''
+                                #     likes = c.get('likes', '0')
+                                #     replies = c.get('comments_count', '0')
+                                #     try:
+                                #         like_count = int(likes)
+                                #     except Exception:
+                                #         like_count = 0
+                                #     try:
+                                #         reply_count = int(replies)
+                                #     except Exception:
+                                #         reply_count = 0
+                                #     status_id = int(hashlib.md5(f"{symbol}|{author}|{content}|{like_count}|{reply_count}".encode('utf-8')).hexdigest()[:15], 16)
+                                #     comment_rows.append(
+                                #         (
+                                #             status_id,
+                                #             comb_id,
+                                #             None,
+                                #             content,
+                                #             now_str,
+                                #             like_count,
+                                #             reply_count,
+                                #             0,
+                                #         )
+                                #     )
 
                             if follow_rows:
                                 self.db.execute_many_safe(

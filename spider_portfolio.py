@@ -272,9 +272,9 @@ class PortfolioCrawler(SpiderPortfolioMixin):
 
             # 8. 依次获取监听到的数据包
             # 捕获评论
-            res_comm = detail_tab.listen.wait(timeout=5)
-            if res_comm:
-                results["comments"] = self._parse_comments_fragment(res_comm.response.body)
+            # res_comm = detail_tab.listen.wait(timeout=5)
+            # if res_comm:
+            #     results["comments"] = self._parse_comments_fragment(res_comm.response.body)
 
             # 捕获调仓 (按顺序读取队列)
             res_rebal = detail_tab.listen.wait(timeout=3)

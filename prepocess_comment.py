@@ -153,7 +153,7 @@ def process_single_text(text, automaton, window_size=100):
         # # 2. 截取上下文
         # start_idx = max(0, first_match_end - window_size)
         # end_idx = min(len(text), first_match_end + window_size)
-        slice_text = text[:500]
+        slice_text = text[:]
         
         # 3. 目标实体掩码 (按长度降序替换，防止别名互相包含)
         all_aliases_in_slice = []
