@@ -19,7 +19,7 @@ PG_POOL_MAX = 10
 
 # === 系统切换配置 ===
 # 可选: "mac" 或 "windows"
-OS_TYPE = "windows"
+OS_TYPE = "mac"
 
 # Chrome 路径（可按需修改）
 CHROME_PATHS = {
@@ -132,7 +132,7 @@ SQL_CREATE_TABLES = [
     """    CREATE TABLE IF NOT EXISTS Value_Comments (
         Comment_Id BIGINT PRIMARY KEY,
         User_Id BIGINT,
-        Content TEXT,
+        Sentiment_Score REAL,
         Publish_Time TEXT,
         Mentioned_Stocks TEXT,
         Category TEXT,
