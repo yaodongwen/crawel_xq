@@ -184,20 +184,30 @@ class AIWorker:
                 if not isinstance(score_logits, list):
                     score_logits = [score_logits]
 
+                # Upsert mentioned stocks and map symbol -> Stock_Id.
+                mentioned_symbols = []
+                for idx in valid_indices:
+                    sym = str(candidates[idx].get("mentioned_stock") or "").strip()
+                    if sym:
+                        mentioned_symbols.append(sym)
+                if mentioned_symbols:
+                    self._db.upsert_stocks([(s, None, None) for s in mentioned_symbols])
+                stock_id_map = self._db.get_stock_id_map(mentioned_symbols)
+
                 insert_rows = []
                 for idx, score in zip(valid_indices, score_logits):
                     c = candidates[idx]
-                    mentioned = str(c.get("mentioned_stock") or "").strip()
-                    if not mentioned:
+                    sym = str(c.get("mentioned_stock") or "").strip()
+                    stock_id = stock_id_map.get(sym)
+                    if not stock_id:
                         continue
                     insert_rows.append(
                         (
                             c["sid"],
                             c.get("user_id"),
-                            mentioned,
+                            stock_id,
                             round(float(self._clamp_score(score)), 2),
                             c.get("publish_time"),
-                            "sentiment",
                             c.get("forward", 0),
                             c.get("comment_count", 0),
                             c.get("like_count", 0),
@@ -208,10 +218,10 @@ class AIWorker:
                     self._db.execute_many_safe(
                         """
                         INSERT INTO Value_Comments (
-                            Comment_Id, User_Id, Mentioned_Stocks, Sentiment_Score, Publish_Time,
-                            Category, Forward, Comment_Count, Like_Count
-                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                        ON CONFLICT (Comment_Id, Mentioned_Stocks) DO NOTHING
+                            Comment_Id, User_Id, Stock_Id, Sentiment_Score, Publish_Time,
+                            Forward, Comment_Count, Like_Count
+                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (Comment_Id, Stock_Id) DO NOTHING
                         """,
                         insert_rows,
                     )

@@ -62,6 +62,9 @@ PIPELINE_BATCH_SIZE = 2
 CACHE_DAYS = 21           
 # AI_MODEL_NAME = "qwen2.5:1.5b" 
 
+# JSON 响应解析失败时是否输出详细日志（默认关闭，避免刷屏）
+VERBOSE_DECODE_ERRORS = False
+
 # === AI 情绪因子模型配置 ===
 # 预处理股票别名字典（本地 JSON）
 STOCK_ALIASES_JSON = os.path.join(BASE_DIR, "data", "ultimate_stock_aliases.json")
@@ -91,11 +94,22 @@ API = {
     'PORTFOLIO': 'portfolio/stock/list.json', 
 }
 
+# === Optional: portfolio comments storage ===
+# 组合动态评论抓取/落库目前默认关闭（省空间/减少请求），需要时改为 True 并在 main_spider 里打开写入逻辑。
+ENABLE_PORTFOLIO_COMMENTS = False
+
 SQL_CREATE_TABLES = [
     # PostgreSQL schema (compatible with existing SQL identifiers)
     """    CREATE TABLE IF NOT EXISTS System_Meta (
         Key TEXT PRIMARY KEY,
         Value TEXT
+    );
+    """,
+    """    CREATE TABLE IF NOT EXISTS Stocks (
+        Stock_Id BIGSERIAL PRIMARY KEY,
+        Stock_Symbol TEXT NOT NULL UNIQUE,
+        Stock_Name TEXT,
+        Market TEXT
     );
     """,
     """    CREATE TABLE IF NOT EXISTS users (
@@ -143,26 +157,26 @@ SQL_CREATE_TABLES = [
     """    CREATE TABLE IF NOT EXISTS Value_Comments (
         Comment_Id BIGINT NOT NULL,
         User_Id BIGINT,
-        Mentioned_Stocks TEXT NOT NULL,
+        Stock_Id BIGINT NOT NULL,
         Sentiment_Score DOUBLE PRECISION,
         Publish_Time TEXT,
-        Category TEXT,
         Forward INTEGER,
         Comment_Count INTEGER,
         Like_Count INTEGER,
-        PRIMARY KEY (Comment_Id, Mentioned_Stocks)
+        PRIMARY KEY (Comment_Id, Stock_Id),
+        FOREIGN KEY (Stock_Id) REFERENCES Stocks(Stock_Id)
     );
     """,
     """    CREATE TABLE IF NOT EXISTS User_Stocks (
         Record_Id BIGSERIAL PRIMARY KEY,
         User_Id BIGINT,
-        Stock_Name TEXT,
-        Stock_Symbol TEXT,
+        Stock_Id BIGINT NOT NULL,
         Current_Price DOUBLE PRECISION,
         Percent DOUBLE PRECISION,
-        Market TEXT,
         Updated_At TEXT,
-        UNIQUE(User_Id, Stock_Symbol)
+        UNIQUE(User_Id, Stock_Id),
+        FOREIGN KEY (User_Id) REFERENCES users(User_Id),
+        FOREIGN KEY (Stock_Id) REFERENCES Stocks(Stock_Id)
     );
     """,
     """    CREATE TABLE IF NOT EXISTS User_Combinations (
@@ -185,8 +199,7 @@ SQL_CREATE_TABLES = [
     """    CREATE TABLE IF NOT EXISTS Portfolio_Transactions (
         Txn_Id BIGSERIAL PRIMARY KEY,
         Comb_Id BIGINT NOT NULL,
-        Stock_Symbol TEXT NOT NULL,
-        Stock_Name TEXT,
+        Stock_Id BIGINT NOT NULL,
         Prev_Weight DOUBLE PRECISION,
         Target_Weight DOUBLE PRECISION,
         Price DOUBLE PRECISION,
@@ -195,32 +208,34 @@ SQL_CREATE_TABLES = [
         Transaction_Time TEXT NOT NULL,
         Notes TEXT,
         FOREIGN KEY (Comb_Id) REFERENCES User_Combinations(Comb_Id),
-        UNIQUE(Comb_Id, Transaction_Time, Stock_Symbol)
+        FOREIGN KEY (Stock_Id) REFERENCES Stocks(Stock_Id),
+        UNIQUE(Comb_Id, Transaction_Time, Stock_Id)
     );
     """,
-    """    CREATE TABLE IF NOT EXISTS Portfolio_Comments (
-        Status_Id BIGINT PRIMARY KEY,
-        Comb_Id BIGINT NOT NULL,
-        User_Id BIGINT,
-        Content TEXT NOT NULL,
-        Publish_Time TEXT NOT NULL,
-        Like_Count INTEGER DEFAULT 0,
-        Reply_Count INTEGER DEFAULT 0,
-        Forward_Count INTEGER DEFAULT 0,
-        FOREIGN KEY (Comb_Id) REFERENCES User_Combinations(Comb_Id),
-        FOREIGN KEY (User_Id) REFERENCES users(User_Id)
-    );
-    """,
+    # """    CREATE TABLE IF NOT EXISTS Portfolio_Comments (
+    #     Status_Id BIGINT PRIMARY KEY,
+    #     Comb_Id BIGINT NOT NULL,
+    #     User_Id BIGINT,
+    #     Content TEXT NOT NULL,
+    #     Publish_Time TEXT NOT NULL,
+    #     Like_Count INTEGER DEFAULT 0,
+    #     Reply_Count INTEGER DEFAULT 0,
+    #     Forward_Count INTEGER DEFAULT 0,
+    #     FOREIGN KEY (Comb_Id) REFERENCES User_Combinations(Comb_Id),
+    #     FOREIGN KEY (User_Id) REFERENCES users(User_Id)
+    # );
+    # """,
     """    CREATE TABLE IF NOT EXISTS Portfolio_Positions (
         Pos_Id BIGSERIAL PRIMARY KEY,
         Comb_Id BIGINT NOT NULL,
         Segment_Name TEXT,
         Segment_Weight TEXT,
-        Stock_Name TEXT,
+        Stock_Id BIGINT,
         Stock_Price TEXT,
         Stock_Weight TEXT,
         Updated_At TEXT,
-        FOREIGN KEY (Comb_Id) REFERENCES User_Combinations(Comb_Id)
+        FOREIGN KEY (Comb_Id) REFERENCES User_Combinations(Comb_Id),
+        FOREIGN KEY (Stock_Id) REFERENCES Stocks(Stock_Id)
     );
     """,
     """    CREATE TABLE IF NOT EXISTS User_Portfolio_Follows (
@@ -234,7 +249,26 @@ SQL_CREATE_TABLES = [
     );
     """,
     "CREATE INDEX IF NOT EXISTS idx_portfolio_txn_comb_time ON Portfolio_Transactions(Comb_Id, Transaction_Time);",
-    "CREATE INDEX IF NOT EXISTS idx_portfolio_comments_comb_time ON Portfolio_Comments(Comb_Id, Publish_Time);",
     "CREATE INDEX IF NOT EXISTS idx_user_portfolio_follows_user ON User_Portfolio_Follows(User_Id);",
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_portfolio_positions_unique ON Portfolio_Positions(Comb_Id, Segment_Name, Stock_Name, Stock_Price, Stock_Weight, Segment_Weight);",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_portfolio_positions_unique ON Portfolio_Positions(Comb_Id, Segment_Name, Stock_Id, Stock_Price, Stock_Weight, Segment_Weight);",
 ]
+
+if ENABLE_PORTFOLIO_COMMENTS:
+    SQL_CREATE_TABLES.extend(
+        [
+            """    CREATE TABLE IF NOT EXISTS Portfolio_Comments (
+                Status_Id BIGINT PRIMARY KEY,
+                Comb_Id BIGINT NOT NULL,
+                User_Id BIGINT,
+                Content TEXT NOT NULL,
+                Publish_Time TEXT NOT NULL,
+                Like_Count INTEGER DEFAULT 0,
+                Reply_Count INTEGER DEFAULT 0,
+                Forward_Count INTEGER DEFAULT 0,
+                FOREIGN KEY (Comb_Id) REFERENCES User_Combinations(Comb_Id),
+                FOREIGN KEY (User_Id) REFERENCES users(User_Id)
+            );
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_portfolio_comments_comb_time ON Portfolio_Comments(Comb_Id, Publish_Time);",
+        ]
+    )

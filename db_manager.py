@@ -114,6 +114,54 @@ class DBManager:
                 cur.execute("SELECT User_Id FROM Target_users")
                 return {row[0] for row in cur.fetchall()}
 
+    def upsert_stocks(self, rows):
+        """Insert/update stock dimension rows.
+
+        rows: list[(symbol, name, market)]
+        """
+        if not rows:
+            return
+        # Deduplicate by symbol to reduce DB churn.
+        dedup = {}
+        for symbol, name, market in rows:
+            sym = (str(symbol).strip() if symbol is not None else "")
+            if not sym:
+                continue
+            dedup[sym] = (sym, (name or None), (market or None))
+        payload = list(dedup.values())
+        if not payload:
+            return
+        self.execute_many_safe(
+            """
+            INSERT INTO Stocks (Stock_Symbol, Stock_Name, Market)
+            VALUES (%s,%s,%s)
+            ON CONFLICT (Stock_Symbol) DO UPDATE SET
+                Stock_Name = COALESCE(Stocks.Stock_Name, EXCLUDED.Stock_Name),
+                Market = COALESCE(Stocks.Market, EXCLUDED.Market)
+            """,
+            payload,
+        )
+
+    def get_stock_id_map(self, symbols):
+        if not symbols:
+            return {}
+        uniq = []
+        seen = set()
+        for s in symbols:
+            sym = (str(s).strip() if s is not None else "")
+            if not sym or sym in seen:
+                continue
+            seen.add(sym)
+            uniq.append(sym)
+        if not uniq:
+            return {}
+        placeholders = ",".join(["%s"] * len(uniq))
+        sql = f"SELECT Stock_Symbol, Stock_Id FROM Stocks WHERE Stock_Symbol IN ({placeholders})"
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, tuple(uniq))
+                return {row[0]: row[1] for row in cur.fetchall()}
+
     def get_portfolio_last_crawled(self, symbol):
         if not symbol:
             return None

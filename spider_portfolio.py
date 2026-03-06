@@ -177,7 +177,22 @@ class PortfolioCrawler(SpiderPortfolioMixin):
                     # 判定为股票行 (stock)，且已进入某个板块
                     elif 'stock' in tag_class and current_segment is not None:
                         # 根据截图，股票名在 div.name，价格在 div.price，权重在 span.stock-weight
+                        stock_symbol = None
+                        link = self._try_ele(item, 'xpath:.//a[contains(@href, "/S/")]', timeout=0.5)
+                        try:
+                            href = link.attr("href") if link else ""
+                        except Exception:
+                            href = ""
+                        if href:
+                            # href examples: /S/SH600519, https://xueqiu.com/S/HK00700?from=...
+                            if "/S/" in href:
+                                stock_symbol = href.split("/S/", 1)[1]
+                            elif href.startswith("S/"):
+                                stock_symbol = href.split("S/", 1)[1]
+                            if stock_symbol:
+                                stock_symbol = stock_symbol.split("?", 1)[0].strip("/").strip()
                         results["Detailed_Position"][-1]["stocks"].append({
+                            "symbol": stock_symbol,
                             "name": self._try_text(item, 'xpath:.//div[contains(@class, "name")]', timeout=1) or "",
                             "price": self._try_text(item, 'xpath:.//div[contains(@class, "price")]', timeout=1) or "",
                             "weight": self._try_text(item, 'xpath:.//span[contains(@class, "stock-weight")]', timeout=1) or ""
@@ -194,8 +209,8 @@ class PortfolioCrawler(SpiderPortfolioMixin):
 
 
     def _mine_portfolio(self, symbol):
+        """完整抓取组合详情（基础信息/持仓/调仓）。"""
         SpiderTools.safe_action(self.driver)
-        """完整抓取函数：修正 JS 错误并防止字典覆盖"""
         # 初始化结果字典，确保数据不会丢失
         results = {
             "symbol": symbol,
@@ -209,7 +224,8 @@ class PortfolioCrawler(SpiderPortfolioMixin):
             detail_tab = self.driver.new_tab()
             
             # 1. 启动监听器 (合并监听)
-            detail_tab.listen.start(['cube/timeline', 'rebalancing/history.json'])
+            # 目前只抓取调仓（JSON）；timeline 返回 HTML 片段，容易触发 decode_response 的 JSON 解析错误。
+            detail_tab.listen.start('rebalancing/history.json')
             detail_tab.get(url)
             SpiderTools.safe_action(self.driver)
 
@@ -266,7 +282,7 @@ class PortfolioCrawler(SpiderPortfolioMixin):
 
             # 7. 触发滚动与点击监听
             detail_tab.scroll.down(1000)
-            history_btn = detail_tab.ele('xpath://a[@class="history"]')
+            history_btn = self._try_ele(detail_tab, 'xpath://a[@class="history"]', timeout=2)
             if history_btn:
                 history_btn.click(by_js=True) 
 
@@ -279,7 +295,9 @@ class PortfolioCrawler(SpiderPortfolioMixin):
             # 捕获调仓 (按顺序读取队列)
             res_rebal = detail_tab.listen.wait(timeout=3)
             if res_rebal:
-                results["rebalances"] = SpiderTools.decode_response(res_rebal)          
+                decoded = SpiderTools.decode_response(res_rebal)
+                if decoded is not None:
+                    results["rebalances"] = decoded
 
             detail_tab.close()
 

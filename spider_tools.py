@@ -105,40 +105,63 @@ class SpiderTools:
 
     @staticmethod
     def decode_response(res):
-        """从监听响应中安全解析 JSON 数据（自动处理 gzip 和自动解析）"""
-        if not res or not hasattr(res.response, 'body') or res.response.body is None:
-            print("error: no res or no res body")
+        """从监听响应中安全解析 JSON 数据（自动处理 gzip）。
+
+        返回 dict/list；若 body 不是 JSON（例如空串/HTML 风控页）则返回 None。
+        """
+        verbose = bool(getattr(config, "VERBOSE_DECODE_ERRORS", False))
+
+        if not res or not hasattr(res, "response") or not hasattr(res.response, "body"):
+            if verbose:
+                print("decode_response: no response/body")
             return None
 
         body = res.response.body
+        if body is None:
+            return None
 
         # 情况1: DrissionPage 已自动解析为 dict/list（新版行为）
         if isinstance(body, (dict, list)):
             return body
 
+        def _parse_text(text):
+            if text is None:
+                return None
+            s = str(text).strip()
+            if not s:
+                return None
+            # 非 JSON（常见：HTML 风控页/跳转页）
+            if s[0] not in "{[":
+                return None
+            try:
+                return json.loads(s)
+            except Exception as e:
+                if verbose:
+                    print(f"decode_response: json parse failed: {e}")
+                return None
+
         # 情况2: 是字符串（明文 JSON）
         if isinstance(body, str):
-            try:
-                return json.loads(body)
-            except Exception as e:
-                print(f"Failed to parse string body as JSON: {e}")
-                return None
+            return _parse_text(body)
 
         # 情况3: 是 bytes（可能是 gzip 压缩或原始 JSON 字节）
         if isinstance(body, bytes):
             try:
                 headers = res.response.headers or {}
-                # 检查是否 gzip 压缩
-                if 'content-encoding' in headers and 'gzip' in headers['content-encoding'].lower():
+                if (
+                    isinstance(headers, dict)
+                    and "content-encoding" in headers
+                    and "gzip" in str(headers["content-encoding"]).lower()
+                ):
                     body = gzip.decompress(body)
-                # 现在 body 应该是 JSON 字符串的 bytes
-                text = body.decode('utf-8')
-                return json.loads(text)
+                text = body.decode("utf-8", errors="ignore")
+                return _parse_text(text)
             except Exception as e:
-                print(f"Failed to decompress or parse bytes body: {e}")
+                if verbose:
+                    print(f"decode_response: bytes decode failed: {e}")
                 return None
 
-        # 其他类型（如 None, int 等）
-        print(f"Unexpected body type: {type(body)}")
+        # 其他类型（如 int 等）
+        if verbose:
+            print(f"decode_response: unexpected body type: {type(body)}")
         return None
-
