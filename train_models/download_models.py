@@ -17,10 +17,25 @@ def check_models_exist(base_dir="."):
             
     return True
 
-def download_my_models():
+def check_data_exist(base_dir=".."):
+    """检查需要的ultimate_stock_aliases.json文件是否存在"""
+    file_path = os.path.join(base_dir, "data","ultimate_stock_aliases.json")
+    if not os.path.exists(file_path):
+        os.makedirs(os.path.join(base_dir, "data"), exist_ok=True)
+        return False
+    
+    return True
+
+def download_my_models(download_data = True):
     # 增加的检测逻辑
-    if check_models_exist():
+    if check_models_exist() and download_data == False:
         print("✅ 检测到本地已存在完整的模型文件夹，跳过下载。")
+        return
+    
+    if download_data == True and check_data_exist():
+        print("✅ 检测到本地已存在完整的json数据文件，跳过下载。")
+
+    if check_models_exist() and check_data_exist():
         return
 
     repo_id = "dongwenyao/quant-sentiment-models"
@@ -32,13 +47,22 @@ def download_my_models():
         local_dir=".",
         allow_patterns=[
             "model_finbert_regression/*", 
-            "model_intent_classifier_best/*", 
-            "model_transformer_intention/*"
+            "model_intent_classifier_best/*"
         ], 
         # 如果你的 HF 仓库设为 Private，需要取消下方注释并传入具有 READ 权限的 token
         # token="你的_HF_READ_TOKEN" 
     )
+    if download_data:
+        snapshot_download(
+            repo_id=repo_id,
+            local_dir="../data",
+            allow_patterns=[
+                "ultimate_stock_aliases.json"
+            ], 
+            # 如果你的 HF 仓库设为 Private，需要取消下方注释并传入具有 READ 权限的 token
+            # token="你的_HF_READ_TOKEN" 
+        )
     print("🎉 模型下载完成！")
 
 if __name__ == "__main__":
-    download_my_models()
+    download_my_models(True)
