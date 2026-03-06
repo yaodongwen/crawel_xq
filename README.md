@@ -33,8 +33,13 @@ python main_spider.py
 - 如需隔离用户数据目录，可改 `USER_DATA_PATHS["windows"]`
 
 ## AI（可选）
-如需启用 AI 价值判断，请提前安装并启动 Ollama：
+如需启用 AI 价值判断，请进入train_models：
 ```bash
-ollama serve
+cd train_models
 ```
-并确保已安装配置中的模型（`config.AI_MODEL_NAME`）。
+然后按照其中的REAMDE进行操作
+
+## 重置数据库
+```bash
+python tools/reset_db.py
+```
