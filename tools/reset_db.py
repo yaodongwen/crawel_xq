@@ -1,3 +1,15 @@
+import sys
+import os
+
+# 获取当前文件的绝对路径
+current_dir = os.path.dirname(os.path.abspath(__file__))
+# 获取父级目录的绝对路径
+parent_dir = os.path.dirname(current_dir)
+
+# 将父级目录添加到 sys.path
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
+    
 import config
 
 try:

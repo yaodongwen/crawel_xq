@@ -19,7 +19,7 @@ PG_POOL_MAX = 10
 
 # === 系统切换配置 ===
 # 可选: "mac" 或 "windows"
-OS_TYPE = "mac"
+OS_TYPE = "windows"
 
 # Chrome 路径（可按需修改）
 CHROME_PATHS = {
@@ -47,17 +47,17 @@ print(f">>> [Config] PostgreSQL: {PG_USER}@{PG_HOST}:{PG_PORT}/{PG_DBNAME}")
 SEED_USER_URL = 'https://xueqiu.com/u/9887656769' 
 
 # TEST
-ARTICLE_COUNT_LIMIT = 5
-FOCUS_COUNT_LIMIT = 20
-TARGET_GOAL = 5
-PIPELINE_BATCH_SIZE = 2
+# ARTICLE_COUNT_LIMIT = 5
+# FOCUS_COUNT_LIMIT = 20
+# TARGET_GOAL = 5
+# PIPELINE_BATCH_SIZE = 2
 
-# ARTICLE_COUNT_LIMIT = 3000
-# FOCUS_COUNT_LIMIT = 300000
-# TARGET_GOAL = 10000
+ARTICLE_COUNT_LIMIT = 3000
+FOCUS_COUNT_LIMIT = 300000
+TARGET_GOAL = 10000
 
-## === 【新增】流水线批次大小 ===
-# PIPELINE_BATCH_SIZE = 10 # 意思是：Step 1 找到 10 个优质用户就停下来，转而去跑 Step 2
+# === 【新增】流水线批次大小 ===
+PIPELINE_BATCH_SIZE = 10 # 意思是：Step 1 找到 10 个优质用户就停下来，转而去跑 Step 2
 
 CACHE_DAYS = 21           
 # AI_MODEL_NAME = "qwen2.5:1.5b" 

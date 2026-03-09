@@ -285,7 +285,7 @@ def generate_ultimate_stock_mapping():
             else:
                 conflict_count += 1
 
-    output_file = 'ultimate_stock_aliases.json'
+    output_file = '../data/ultimate_stock_aliases.json'
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(final_dict, f, ensure_ascii=False, indent=4)
         
