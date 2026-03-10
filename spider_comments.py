@@ -136,10 +136,21 @@ class CommentsCrawler:
             SpiderTools.safe_action(driver)
             try:
                 user_completed = False
-                last_crawled = db.get_user_comments_last_crawled(uid)
-                last_dt = self._parse_time(last_crawled)
+
+                # Resume/de-dup: if the user already has enough comments in DB, skip crawling.
+                existing_count = db.get_user_raw_statuses_count(uid)
+                if existing_count >= config.ARTICLE_COUNT_LIMIT:
+                    print(f"    -> 已有 {existing_count} 条评论，跳过爬取")
+                    db.update_task_status(uid, "Target_users")
+                    continue
+
+                # For resume after interruption, we crawl older than the current oldest record.
+                oldest_created_at = db.get_user_raw_oldest_created_at(uid)
+                oldest_dt = self._parse_time(oldest_created_at) if oldest_created_at else None
+                remaining_needed = max(0, config.ARTICLE_COUNT_LIMIT - existing_count)
+
+                # Keep newest_seen for incremental updates metadata.
                 newest_seen = None
-                reached_old = False
                 target_api = 'user_timeline.json'
                 list_tab.listen.start(target_api)
 
@@ -153,7 +164,7 @@ class CommentsCrawler:
                 # --- 定义内部函数：统一处理每一页的数据解析逻辑 ---
                 # 这样第一页和翻页后的代码不用写两遍
                 def process_page_data(response_data):
-                    nonlocal newest_seen, reached_old
+                    nonlocal newest_seen
                     rows = []
                     if response_data and 'statuses' in response_data:
                         for s in response_data['statuses']:
@@ -161,8 +172,10 @@ class CommentsCrawler:
                             created_dt = self._parse_time(readable_time)
                             if created_dt and (newest_seen is None or created_dt > newest_seen):
                                 newest_seen = created_dt
-                            if last_dt and created_dt and created_dt <= last_dt:
-                                reached_old = True
+
+                            # Resume mode: when we already have some records, skip newer ones and only
+                            # collect items older than the oldest record we already stored.
+                            if oldest_dt and created_dt and created_dt > oldest_dt:
                                 continue
 
                             # === 1. 尝试获取普通内容 ===
@@ -216,7 +229,7 @@ class CommentsCrawler:
                         print(f"    ⚠️ 第一页超时或无数据")
 
                 # --- 循环翻页直到达标 ---
-                while total_added < config.ARTICLE_COUNT_LIMIT:
+                while total_added < remaining_needed:
                     if self._stop_event and self._stop_event.is_set():
                         break
                     if SpiderTools.has_slider(driver):
@@ -250,15 +263,17 @@ class CommentsCrawler:
                             break  # 没包
                     else:
                         break  # 没按钮了
-                    if reached_old:
-                        break
 
                 list_tab.listen.stop()
-                print(f"    -> 完成: {uname} (入库: {total_added})")
+
+                final_count = existing_count + total_added
+                print(f"    -> 完成: {uname} (本次入库: {total_added} | 累计: {final_count})")
                 if not (self._stop_event and self._stop_event.is_set()):
                     user_completed = True
                 if user_completed:
-                    db.update_task_status(uid, "Target_users")
+                    # Only mark task done when we already have enough records.
+                    if final_count >= config.ARTICLE_COUNT_LIMIT:
+                        db.update_task_status(uid, "Target_users")
                     if newest_seen:
                         db.set_user_comments_last_crawled(uid, newest_seen.strftime("%Y-%m-%d %H:%M:%S"))
 

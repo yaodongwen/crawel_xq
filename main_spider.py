@@ -185,6 +185,7 @@ class XueqiuSpider:
             print(f"    Check: {uname} | AI待办: {ai_left}", end='\r')
             stock_ok = False
             portfolio_ok = False
+            is_target_user = False
 
             if uid in self.target_ids_cache:
                 # print("user in cache, continue!")
@@ -228,6 +229,9 @@ class XueqiuSpider:
                     stock_btn.click()
                     end_time = time.time() + 4
                     has_agu = False; has_waipan = False; now_str = SpiderTools.get_now_str()
+                    stock_dim_rows = []
+                    tmp = []
+                    got_items = False
                     
                     while time.time() < end_time:
                         res = tab.listen.wait(timeout=1.0)
@@ -245,9 +249,6 @@ class XueqiuSpider:
                                 if 'data' in data and 'items' in data['data']: items = data['data']['items']
                                 elif 'items' in data: items = data['items']
                             if items:
-                                stock_dim_rows = []
-                                user_stock_rows = []
-                                tmp = []
                                 for it in items:
                                     s = it.get('quote', it)
                                     symbol = s.get('symbol') or s.get('code', '')
@@ -259,31 +260,37 @@ class XueqiuSpider:
                                     name = s.get('name', '') or None
                                     stock_dim_rows.append((symbol, name, market if market != '未知' else None))
                                     tmp.append((symbol, float(s.get('current',0) or 0), float(s.get('percent',0) or 0)))
+                                got_items = True
+                                break
 
-                                if stock_dim_rows:
-                                    self.db.upsert_stocks(stock_dim_rows)
-                                    stock_id_map = self.db.get_stock_id_map([r[0] for r in stock_dim_rows])
-                                    for symbol, current_price, pct in tmp:
-                                        stock_id = stock_id_map.get(symbol)
-                                        if not stock_id:
-                                            continue
-                                        user_stock_rows.append((uid, stock_id, current_price, pct, now_str))
+                    is_target_user = bool(has_agu and has_waipan)
 
-                                if user_stock_rows:
-                                    self.db.execute_many_safe(
-                                        """
-                                        INSERT INTO User_Stocks (
-                                            User_Id, Stock_Id, Current_Price, Percent, Updated_At
-                                        ) VALUES (%s,%s,%s,%s,%s)
-                                        ON CONFLICT (User_Id, Stock_Id) DO UPDATE SET
-                                            Current_Price = EXCLUDED.Current_Price,
-                                            Percent = EXCLUDED.Percent,
-                                            Updated_At = EXCLUDED.Updated_At
-                                        """,
-                                        user_stock_rows,
-                                    )
+                    # Only persist holdings for target users (avoid wasting IO for non-target users).
+                    if got_items and is_target_user and stock_dim_rows:
+                        user_stock_rows = []
+                        self.db.upsert_stocks(stock_dim_rows)
+                        stock_id_map = self.db.get_stock_id_map([r[0] for r in stock_dim_rows])
+                        for symbol, current_price, pct in tmp:
+                            stock_id = stock_id_map.get(symbol)
+                            if not stock_id:
+                                continue
+                            user_stock_rows.append((uid, stock_id, current_price, pct, now_str))
 
-                    if has_agu and has_waipan:
+                        if user_stock_rows:
+                            self.db.execute_many_safe(
+                                """
+                                INSERT INTO User_Stocks (
+                                    User_Id, Stock_Id, Current_Price, Percent, Updated_At
+                                ) VALUES (%s,%s,%s,%s,%s)
+                                ON CONFLICT (User_Id, Stock_Id) DO UPDATE SET
+                                    Current_Price = EXCLUDED.Current_Price,
+                                    Percent = EXCLUDED.Percent,
+                                    Updated_At = EXCLUDED.Updated_At
+                                """,
+                                user_stock_rows,
+                            )
+
+                    if is_target_user:
                         # `row` is a PostgreSQL dict row; build values explicitly (don't use list(row) which yields keys).
                         target_data = (
                             uid,
@@ -315,6 +322,12 @@ class XueqiuSpider:
                 if not self.stop_event.is_set():
                     stock_ok = True
 
+            # If not a target user, skip portfolio crawling entirely to reduce requests and avoid 405 risk.
+            if not is_target_user:
+                if not self.stop_event.is_set():
+                    self.db.update_task_status(uid, "High_quality_users")
+                continue
+
             # 组合
             try:
                 tab.get(f"https://xueqiu.com/u/{uid}")
@@ -325,301 +338,286 @@ class XueqiuSpider:
                 # 创建的组合会自动加载
                 # build_btn = tab.ele('xpath://div[contains(@class, "profile-tab-item") and text()="创建的组合"]')
                 if portfolio_btn:
-                    portfolio_btn.click()
-                    end_time = time.time() + 4
+                    portfolio_btn.click(by_js=True)
+                    SpiderTools.random_sleep(0.6, 1.0)
+                    end_time = time.time() + 6
                     now_str = SpiderTools.get_now_str()
-                    # 关注组合（需要先进入 portfolio 页签后才会出现；且按钮文案可能带数量，使用 contains 更稳）
-                    follow_btn = tab.ele(
-                        'xpath://div[contains(@class, "profile-tab-item") and contains(normalize-space(.), "关注的组合")]',
-                        timeout=2,
-                    )
-                    if follow_btn:
-                        follow_btn.click(by_js=True)  # 必须用 JS 点击！
-                    else:
-                        print("没有找到用户收藏的组合按钮")
-                    
-                    while time.time() < end_time:
-                        res = tab.listen.wait(timeout=1.0)
-                        if not res: continue
-                        data = res.response.body
-                        if not data:
-                            continue
+                    # 组合页签下通常有子页签：创建的组合 / 关注的组合（有时默认就是关注页）。
+                    # 这里两者都抓，避免遗漏。
+                    def _find_sub_tab(keyword):
+                        locators = (
+                            # Xueqiu often stores the sub-tab text inside data-analytics-data JSON (sub_tab field).
+                            f'xpath://*[@id="app"]//a[contains(@data-analytics-data, "sub_tab") and contains(@data-analytics-data, "{keyword}")]',
+                            f'xpath://*[@id="app"]//a[contains(@data-analytics-data, "{keyword}")]',
+                            f'xpath://*[@id="app"]//a[normalize-space(.)="{keyword}"]',
+                            f'xpath://*[@id="app"]//a[contains(normalize-space(.), "{keyword}")]',
+                        )
+                        for loc in locators:
+                            try:
+                                el = tab.ele(loc, timeout=0.6)
+                            except Exception:
+                                el = None
+                            try:
+                                if el and el.states.is_displayed:
+                                    return el
+                            except Exception:
+                                continue
+                        return None
 
-                        payload = SpiderTools.decode_response(res) or data
-                        iterator = _extract_portfolios(payload)
+                    def _find_sub_tab_any(keywords):
+                        for kw in keywords:
+                            el = _find_sub_tab(kw)
+                            if el:
+                                return el
+                        return None
 
-                        if iterator: # 组合
-                            comb_rows = []
-                            update_rows = []
-                            follow_rows = []
-                            rebalance_tmp_rows = []
-                            comment_rows = []
-                            position_tmp_rows = []
-                            stock_dim_rows = []
-                            detail_cache = []
+                    created_tab = None
+                    followed_tab = None
+                    # Sub tabs may render asynchronously after entering portfolio; wait a bit.
+                    subtab_deadline = time.time() + 5
+                    while time.time() < subtab_deadline and not (created_tab and followed_tab):
+                        created_tab = created_tab or _find_sub_tab_any(("创建的组合",))
+                        # 关注页在不同版本可能显示为“关注的组合”或“收藏的组合”
+                        followed_tab = followed_tab or _find_sub_tab_any(("关注的组合", "收藏的组合"))
+                        time.sleep(0.3)
 
-                            for item in iterator:
-                                if not isinstance(item, dict):
-                                    continue
-                                symbol = item.get('symbol') or item.get('cube_symbol')
-                                if not symbol:
-                                    print(f"warning: cannot get symbol in portfolio: {item}")
-                                    continue
+                    if bool(getattr(config, "PORTFOLIO_TAB_DEBUG", False)):
+                        try:
+                            debug_max = int(getattr(config, "PORTFOLIO_TAB_DEBUG_MAX", 20) or 20)
+                            items = tab.eles('xpath://*[@id="app"]//a[contains(@data-analytics-data,"sub_tab")]')
+                            if not items:
+                                items = tab.eles('xpath://*[@id="app"]//a')
+                            rows = []
+                            for it in items[:debug_max]:
+                                try:
+                                    t = (it.text or "").strip()
+                                except Exception:
+                                    t = ""
+                                try:
+                                    cls = (it.attr("class") or "").strip()
+                                except Exception:
+                                    cls = ""
+                                try:
+                                    data = (it.attr("data-analytics-data") or "").strip()
+                                except Exception:
+                                    data = ""
+                                if len(data) > 160:
+                                    data = data[:160] + "..."
+                                if t or "sub_tab" in data:
+                                    rows.append({"text": t, "class": cls, "data": data})
+                            print(f">>> [组合页签调试] candidates={len(items)} show={len(rows)} rows={rows}")
+                        except Exception:
+                            print(">>> [组合页签调试] tabs=[]")
 
-                                skip_detail, last_crawled = self.db.should_skip_portfolio(
-                                    symbol, config.PORTFOLIO_CACHE_HOURS
-                                )
-                                detail = None
-                                if not skip_detail:
-                                    try:
-                                        detail = self._portfolio_crawler._mine_portfolio(symbol)
-                                    except Exception as e:
-                                        print(f"error in get portfolio information: {e}")
-                                        detail = None
-                                detail_ok = isinstance(detail, dict)
-                                # Only update crawl time when detail is fetched successfully.
-                                last_crawled_value = now_str if detail_ok else last_crawled
+                    sub_tabs = []
+                    if created_tab:
+                        sub_tabs.append(("创建的组合", created_tab))
+                    if followed_tab:
+                        sub_tabs.append(("关注的组合", followed_tab))
 
-                                create_user_id = detail.get('create_user_id') if isinstance(detail, dict) else None
-                                if str(create_user_id).isdigit():
-                                    creator_id = int(create_user_id)
-                                else:
-                                    creator_id = 0 #无Id
+                    if not sub_tabs:
+                        print("没有找到用户关注/创建的组合按钮（将继续使用默认页签数据）")
 
-                                def _to_float(val):
-                                    if val is None:
-                                        return 0.0
-                                    if isinstance(val, (int, float)):
-                                        return float(val)
-                                    s = str(val).strip()
-                                    if not s or s in ("--", "None"):
-                                        return 0.0
-                                    s = s.replace("%", "").replace(",", "")
-                                    try:
-                                        return float(s)
-                                    except Exception:
-                                        return 0.0
+                    processed_symbols = set()
 
-                                name = detail.get('portfolio_name') if isinstance(detail, dict) else item.get('name')
-                                net_value = detail.get('Net_Worth') if isinstance(detail, dict) else item.get('net_value')
-                                total_gain = detail.get('Total_Return_Percentage') if isinstance(detail, dict) else item.get('total_gain', 0)
-                                monthly_gain = detail.get('Monthly_Return_Percentage') if isinstance(detail, dict) else item.get('monthly_gain', 0)
-                                daily_gain = detail.get('Daily_Return_Percentage') if isinstance(detail, dict) else item.get('daily_gain', 0)
-                                create_time = detail.get('create_time') if isinstance(detail, dict) else None
-                                close_time = detail.get('close_time') if isinstance(detail, dict) else item.get('closed_at', 0)
-                                description = detail.get('portfolio_description') if isinstance(detail, dict) else None
-                                is_public = 1
+                    def _process_iterator(iterator, default_build_or_collection):
+                        if not iterator:
+                            return
 
-                                comb_rows.append((
-                                    creator_id,
-                                    symbol,
-                                    name,
-                                    _to_float(net_value),
-                                    _to_float(total_gain),
-                                    _to_float(monthly_gain),
-                                    _to_float(daily_gain),
-                                    create_time,
-                                    now_str,
-                                    last_crawled_value,
-                                    str(close_time or 0),
-                                    description,
-                                    is_public,
-                                ))
-                                update_rows.append((
-                                    creator_id,
-                                    name,
-                                    _to_float(net_value),
-                                    _to_float(total_gain),
-                                    _to_float(monthly_gain),
-                                    _to_float(daily_gain),
-                                    create_time,
-                                    now_str,
-                                    last_crawled_value,
-                                    str(close_time or 0),
-                                    description,
-                                    is_public,
-                                    symbol,
-                                ))
-                                detail_cache.append((symbol, detail, creator_id))
+                        comb_rows = []
+                        update_rows = []
+                        follow_rows = []
+                        rebalance_rows = []
+                        comment_rows = []
+                        position_rows = []
+                        detail_cache = []
 
-                            if comb_rows:
-                                self.db.execute_many_safe(
-                                    """
-                                    INSERT INTO User_Combinations (
-                                        User_Id, Symbol, Name, Net_Value, Total_Gain, Monthly_Gain, Daily_Gain,
-                                        Create_Time, Updated_At, Portfolio_Last_Crawled, Close_At_Time, Description, Is_Public
-                                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                                    ON CONFLICT (Symbol) DO NOTHING
-                                    """,
-                                    comb_rows,
-                                )
-                            if update_rows:
-                                self.db.execute_many_safe(
-                                    "UPDATE User_Combinations SET User_Id=%s, Name=%s, Net_Value=%s, Total_Gain=%s, Monthly_Gain=%s, Daily_Gain=%s, Create_Time=%s, Updated_At=%s, Portfolio_Last_Crawled=%s, Close_At_Time=%s, Description=%s, Is_Public=%s WHERE Symbol=%s",
-                                    update_rows,
-                                )
+                        for item in iterator:
+                            if not isinstance(item, dict):
+                                continue
+                            symbol = item.get("symbol") or item.get("cube_symbol")
+                            if not symbol or symbol in processed_symbols:
+                                continue
+                            processed_symbols.add(symbol)
 
-                            symbols = [row[1] for row in comb_rows if row and len(row) > 1 and row[1]]
-                            comb_id_map = self.db.get_comb_ids_by_symbols(symbols)
+                            skip_detail, last_crawled = self.db.should_skip_portfolio(
+                                symbol, config.PORTFOLIO_CACHE_HOURS
+                            )
+                            detail = None
+                            if not skip_detail:
+                                try:
+                                    detail = self._portfolio_crawler._mine_portfolio(symbol)
+                                except Exception as e:
+                                    print(f"error in get portfolio information: {e}")
+                                    detail = None
+                            detail_ok = isinstance(detail, dict)
+                            last_crawled_value = now_str if detail_ok else last_crawled
 
-                            for symbol, detail, creator_id in detail_cache:
-                                comb_id = comb_id_map.get(symbol)
-                                build_or_collection = 0 if int(creator_id) == int(uid) else 1
-                                follow_rows.append((uid, symbol, build_or_collection, now_str))
-                                if not comb_id:
-                                    continue
+                            create_user_id = detail.get("create_user_id") if isinstance(detail, dict) else None
+                            if str(create_user_id).isdigit():
+                                creator_id = int(create_user_id)
+                            else:
+                                creator_id = 0
 
-                                if not isinstance(detail, dict):
-                                    continue
+                            def _to_float(val):
+                                if val is None:
+                                    return 0.0
+                                if isinstance(val, (int, float)):
+                                    return float(val)
+                                s = str(val).strip()
+                                if not s or s in ("--", "None"):
+                                    return 0.0
+                                s = s.replace("%", "").replace(",", "")
+                                try:
+                                    return float(s)
+                                except Exception:
+                                    return 0.0
 
-                                # Detailed positions -> Portfolio_Positions
-                                positions = detail.get('Detailed_Position')
-                                if isinstance(positions, list):
-                                    for seg in positions:
-                                        if not isinstance(seg, dict):
-                                            print(f"seg type is {type(seg)}")
-                                            continue
-                                        seg_name = seg.get('category_name')
-                                        seg_weight = seg.get('proportion')
-                                        stocks = seg.get('stocks', [])
-                                        if not isinstance(stocks, list) or not stocks:
-                                            position_tmp_rows.append(
-                                                (comb_id, seg_name, seg_weight, None, None, None, now_str)
-                                            )
-                                            if not isinstance(stocks, list):
-                                                print(f"stocks type is {type(stocks)}")
-                                            continue
-                                        for s in stocks:
-                                            if not isinstance(s, dict):
-                                                continue
-                                            stock_symbol = s.get("symbol") or s.get("stock_symbol") or s.get("code")
-                                            stock_name = s.get("name") or None
-                                            if stock_symbol:
-                                                stock_dim_rows.append((stock_symbol, stock_name, None))
-                                            position_tmp_rows.append(
-                                                (
-                                                    comb_id,
-                                                    seg_name,
-                                                    seg_weight,
-                                                    stock_symbol,
-                                                    s.get('price'),
-                                                    s.get('weight'),
-                                                    now_str,
-                                                )
-                                            )
-                                elif positions is None:
-                                    pass
-                                else:
-                                    print(f"Detailed_Position type is {type(positions)}")
+                            name = detail.get("portfolio_name") if isinstance(detail, dict) else item.get("name")
+                            net_value = detail.get("Net_Worth") if isinstance(detail, dict) else item.get("net_value")
+                            total_gain = detail.get("Total_Return_Percentage") if isinstance(detail, dict) else item.get("total_gain", 0)
+                            monthly_gain = detail.get("Monthly_Return_Percentage") if isinstance(detail, dict) else item.get("monthly_gain", 0)
+                            daily_gain = detail.get("Daily_Return_Percentage") if isinstance(detail, dict) else item.get("daily_gain", 0)
+                            create_time = detail.get("create_time") if isinstance(detail, dict) else None
+                            close_time = detail.get("close_time") if isinstance(detail, dict) else item.get("closed_at", 0)
+                            description = detail.get("portfolio_description") if isinstance(detail, dict) else None
+                            is_public = 1
 
-                                # Rebalancing history -> Portfolio_Transactions
-                                rebalances = detail.get('rebalances')
-                                reb_list = []
-                                if isinstance(rebalances, dict):
-                                    if isinstance(rebalances.get('list'), list):
-                                        reb_list = rebalances['list']
-                                    elif isinstance(rebalances.get('data'), dict) and isinstance(rebalances['data'].get('list'), list):
-                                        reb_list = rebalances['data']['list']
-                                    elif isinstance(rebalances.get('data'), list):
-                                        reb_list = rebalances['data']
-                                elif isinstance(rebalances, list):
-                                    reb_list = rebalances
-                                else:
-                                    if rebalances is not None:
-                                        print(f"rebalances type is {type(rebalances)}")
+                            comb_rows.append((
+                                creator_id,
+                                symbol,
+                                name,
+                                _to_float(net_value),
+                                _to_float(total_gain),
+                                _to_float(monthly_gain),
+                                _to_float(daily_gain),
+                                create_time,
+                                now_str,
+                                last_crawled_value,
+                                str(close_time or 0),
+                                description,
+                                is_public,
+                            ))
+                            update_rows.append((
+                                creator_id,
+                                name,
+                                _to_float(net_value),
+                                _to_float(total_gain),
+                                _to_float(monthly_gain),
+                                _to_float(daily_gain),
+                                create_time,
+                                now_str,
+                                last_crawled_value,
+                                str(close_time or 0),
+                                description,
+                                is_public,
+                                symbol,
+                            ))
+                            detail_cache.append((symbol, detail, creator_id))
 
-                                for reb in reb_list:
-                                    if not isinstance(reb, dict):
+                            # Follow mapping: mark which sub tab it came from if we can.
+                            follow_rows.append((uid, symbol, default_build_or_collection, now_str))
+
+                        if comb_rows:
+                            self.db.execute_many_safe(
+                                """
+                                INSERT INTO User_Combinations (
+                                    User_Id, Symbol, Name, Net_Value, Total_Gain, Monthly_Gain, Daily_Gain,
+                                    Create_Time, Updated_At, Portfolio_Last_Crawled, Close_At_Time, Description, Is_Public
+                                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                                ON CONFLICT (Symbol) DO NOTHING
+                                """,
+                                comb_rows,
+                            )
+                        if update_rows:
+                            self.db.execute_many_safe(
+                                "UPDATE User_Combinations SET User_Id=%s, Name=%s, Net_Value=%s, Total_Gain=%s, Monthly_Gain=%s, Daily_Gain=%s, Create_Time=%s, Updated_At=%s, Portfolio_Last_Crawled=%s, Close_At_Time=%s, Description=%s, Is_Public=%s WHERE Symbol=%s",
+                                update_rows,
+                            )
+
+                        if follow_rows:
+                            self.db.execute_many_safe(
+                                """
+                                INSERT INTO User_Portfolio_Follows (User_Id, Symbol, Build_Or_Collection, Follow_Time)
+                                VALUES (%s,%s,%s,%s)
+                                ON CONFLICT (User_Id, Symbol) DO NOTHING
+                                """,
+                                follow_rows,
+                            )
+
+                        # For positions/transactions/comments we rely on detail_cache and comb_id map (existing logic below),
+                        # but only when detail is fetched.
+                        symbols = [row[1] for row in comb_rows if row and len(row) > 1 and row[1]]
+                        comb_id_map = self.db.get_comb_ids_by_symbols(symbols)
+                        stock_upsert_rows = []
+                        position_rows_raw = []
+                        rebalance_rows_raw = []
+
+                        def _guess_market(sym):
+                            if not isinstance(sym, str):
+                                return None
+                            s = sym.upper()
+                            if s.startswith(("SH", "SZ")):
+                                return "CN"
+                            if s.startswith("HK"):
+                                return "HK"
+                            if s.startswith(("US", "NYSE", "NASDAQ")):
+                                return "US"
+                            return None
+
+                        for symbol, detail, creator_id in detail_cache:
+                            comb_id = comb_id_map.get(symbol)
+                            if not comb_id or not isinstance(detail, dict):
+                                continue
+                            positions = detail.get("Detailed_Position")
+                            if isinstance(positions, list):
+                                for seg in positions:
+                                    if not isinstance(seg, dict):
                                         continue
-                                    status = reb.get('status')
-                                    cash_value = reb.get('cash_value') or reb.get('cash')
-                                    reb_time = SpiderTools.format_time(reb.get('updated_at') or reb.get('created_at') or reb.get('updatedAt'))
-                                    histories = reb.get('rebalancing_histories') or reb.get('rebalancingHistories') or []
-                                    if not isinstance(histories, list):
-                                        histories = []
-                                    for h in histories:
-                                        if not isinstance(h, dict):
-                                            continue
-                                        stock_symbol = h.get('stock_symbol') or h.get('stockSymbol')
-                                        if not stock_symbol:
-                                            continue
-                                        stock_name = h.get('stock_name') or h.get('stockName')
-                                        prev_weight = h.get('weight') or h.get('prev_weight')
-                                        target_weight = h.get('target_weight')
-                                        price = h.get('price')
-                                        notes = h.get('comment') if isinstance(h.get('comment'), str) else None
-                                        stock_dim_rows.append((stock_symbol, stock_name or None, None))
-                                        rebalance_tmp_rows.append(
-                                            (
-                                                comb_id,
-                                                stock_symbol,
-                                                prev_weight,
-                                                target_weight,
-                                                price,
-                                                cash_value,
-                                                status,
-                                                reb_time,
-                                                notes,
-                                            )
-                                        )
-
-                                # Comments -> Portfolio_Comments
-                                # comments = detail.get('comments') if isinstance(detail.get('comments'), list) else []
-                                # for c in comments:
-                                #     if not isinstance(c, dict):
-                                #         continue
-                                #     author = c.get('author', '')
-                                #     content = c.get('text', '') or ''
-                                #     likes = c.get('likes', '0')
-                                #     replies = c.get('comments_count', '0')
-                                #     try:
-                                #         like_count = int(likes)
-                                #     except Exception:
-                                #         like_count = 0
-                                #     try:
-                                #         reply_count = int(replies)
-                                #     except Exception:
-                                #         reply_count = 0
-                                #     status_id = int(hashlib.md5(f"{symbol}|{author}|{content}|{like_count}|{reply_count}".encode('utf-8')).hexdigest()[:15], 16)
-                                #     comment_rows.append(
-                                #         (
-                                #             status_id,
-                                #             comb_id,
-                                #             None,
-                                #             content,
-                                #             now_str,
-                                #             like_count,
-                                #             reply_count,
-                                #             0,
-                                #         )
-                                #     )
-
-                                # Resolve stock symbols -> Stock_Id and build final rows.
-                                stock_id_map = {}
-                                if stock_dim_rows:
-                                    self.db.upsert_stocks(stock_dim_rows)
-                                    stock_id_map = self.db.get_stock_id_map([r[0] for r in stock_dim_rows])
-
-                                position_rows = []
-                                for comb_id, seg_name, seg_weight, stock_symbol, stock_price, stock_weight, updated_at in position_tmp_rows:
-                                    stock_id = None
-                                    if stock_symbol:
-                                        stock_id = stock_id_map.get(stock_symbol)
-                                        if not stock_id:
-                                            continue
-                                    position_rows.append(
-                                        (comb_id, seg_name, seg_weight, stock_id, stock_price, stock_weight, updated_at)
-                                    )
-
-                                rebalance_rows = []
-                                for comb_id, stock_symbol, prev_weight, target_weight, price, cash_value, status, reb_time, notes in rebalance_tmp_rows:
-                                    stock_id = stock_id_map.get(stock_symbol)
-                                    if not stock_id:
+                                    seg_name = seg.get("category_name")
+                                    seg_weight = seg.get("proportion")
+                                    stocks = seg.get("stocks", [])
+                                    if not isinstance(stocks, list) or not stocks:
                                         continue
-                                    rebalance_rows.append(
+                                    for s in stocks:
+                                        if not isinstance(s, dict):
+                                            continue
+                                        stock_symbol = s.get("symbol")
+                                        stock_name = s.get("name")
+                                        stock_price = s.get("price")
+                                        stock_weight = s.get("weight")
+                                        if stock_symbol:
+                                            stock_upsert_rows.append((stock_symbol, stock_name, _guess_market(stock_symbol)))
+                                            position_rows_raw.append(
+                                                (comb_id, seg_name, seg_weight, stock_symbol, stock_price, stock_weight, now_str)
+                                            )
+
+                            rebalances = detail.get("rebalances") if isinstance(detail.get("rebalances"), list) else []
+                            for reb in rebalances:
+                                if not isinstance(reb, dict):
+                                    continue
+                                cash_value = reb.get("cash_value") or reb.get("cashValue")
+                                status = reb.get("status")
+                                reb_time = SpiderTools.format_time(reb.get("updated_at") or reb.get("created_at") or reb.get("updatedAt"))
+                                histories = reb.get("rebalancing_histories") or reb.get("rebalancingHistories") or []
+                                if not isinstance(histories, list):
+                                    histories = []
+                                for h in histories:
+                                    if not isinstance(h, dict):
+                                        continue
+                                    stock_symbol = h.get("stock_symbol") or h.get("stockSymbol")
+                                    if not stock_symbol:
+                                        continue
+                                    stock_name = h.get("stock_name") or h.get("stockName")
+                                    prev_weight = h.get("weight") or h.get("prev_weight")
+                                    target_weight = h.get("target_weight")
+                                    price = h.get("price")
+                                    notes = h.get("comment") if isinstance(h.get("comment"), str) else None
+                                    stock_upsert_rows.append((stock_symbol, stock_name, _guess_market(stock_symbol)))
+                                    rebalance_rows_raw.append(
                                         (
                                             comb_id,
-                                            stock_id,
+                                            stock_symbol,
                                             prev_weight,
                                             target_weight,
                                             price,
@@ -630,46 +628,187 @@ class XueqiuSpider:
                                         )
                                     )
 
-                                if follow_rows:
-                                    self.db.execute_many_safe(
-                                        """
-                                        INSERT INTO User_Portfolio_Follows (User_Id, Symbol, Build_Or_Collection, Follow_Time)
-                                        VALUES (%s,%s,%s,%s)
-                                        ON CONFLICT (User_Id, Symbol) DO NOTHING
-                                        """,
-                                        follow_rows,
-                                    )
-                                if position_rows:
-                                    self.db.execute_many_safe(
-                                        """
-                                        INSERT INTO Portfolio_Positions (
-                                            Comb_Id, Segment_Name, Segment_Weight, Stock_Id, Stock_Price, Stock_Weight, Updated_At
-                                        ) VALUES (%s,%s,%s,%s,%s,%s,%s)
-                                        ON CONFLICT DO NOTHING
-                                        """,
-                                        position_rows,
-                                    )
-                                if rebalance_rows:
-                                    self.db.execute_many_safe(
-                                        """
-                                        INSERT INTO Portfolio_Transactions (
-                                            Comb_Id, Stock_Id, Prev_Weight, Target_Weight,
-                                            Price, Cash_Value, Status, Transaction_Time, Notes
-                                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                                        ON CONFLICT DO NOTHING
-                                        """,
-                                        rebalance_rows,
-                                    )
-                            # if comment_rows:
-                            #     self.db.execute_many_safe(
-                            #         """
-                            #         INSERT INTO Portfolio_Comments (
-                            #             Status_Id, Comb_Id, User_Id, Content, Publish_Time, Like_Count, Reply_Count, Forward_Count
-                            #         ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-                            #         ON CONFLICT (Status_Id) DO NOTHING
-                            #         """,
-                            #         comment_rows,
-                            #     )
+                            comments = detail.get("comments") if isinstance(detail.get("comments"), list) else []
+                            for c in comments:
+                                if not isinstance(c, dict):
+                                    continue
+                                author = c.get("author", "")
+                                content = c.get("text", "") or ""
+                                likes = c.get("likes", "0")
+                                replies = c.get("comments_count", "0")
+                                try:
+                                    like_count = int(likes)
+                                except Exception:
+                                    like_count = 0
+                                try:
+                                    reply_count = int(replies)
+                                except Exception:
+                                    reply_count = 0
+                                status_id = int(
+                                    hashlib.md5(f"{symbol}|{author}|{content}|{like_count}|{reply_count}".encode("utf-8")).hexdigest()[:15],
+                                    16,
+                                )
+                                comment_rows.append((status_id, comb_id, None, content, now_str, like_count, reply_count, 0))
+
+                        # === Map stock symbols to Stock_Id for Portfolio_Positions / Portfolio_Transactions ===
+                        if stock_upsert_rows:
+                            self.db.upsert_stocks(stock_upsert_rows)
+                        stock_id_map = self.db.get_stock_id_map([r[0] for r in stock_upsert_rows if r and r[0]])
+
+                        position_rows = []
+                        for comb_id, seg_name, seg_weight, stock_symbol, stock_price, stock_weight, updated_at in position_rows_raw:
+                            stock_id = stock_id_map.get(str(stock_symbol).strip()) if stock_symbol else None
+                            if not stock_id:
+                                continue
+                            position_rows.append(
+                                (comb_id, seg_name, seg_weight, stock_id, stock_price, stock_weight, updated_at)
+                            )
+
+                        rebalance_rows = []
+                        for comb_id, stock_symbol, prev_weight, target_weight, price, cash_value, status, reb_time, notes in rebalance_rows_raw:
+                            stock_id = stock_id_map.get(str(stock_symbol).strip()) if stock_symbol else None
+                            if not stock_id:
+                                continue
+                            rebalance_rows.append(
+                                (
+                                    comb_id,
+                                    stock_id,
+                                    _to_float(prev_weight),
+                                    _to_float(target_weight),
+                                    _to_float(price),
+                                    _to_float(cash_value),
+                                    status,
+                                    reb_time or now_str,
+                                    notes,
+                                )
+                            )
+
+                        if position_rows:
+                            self.db.execute_many_safe(
+                                """
+                                INSERT INTO Portfolio_Positions (
+                                    Comb_Id, Segment_Name, Segment_Weight, Stock_Id, Stock_Price, Stock_Weight, Updated_At
+                                ) VALUES (%s,%s,%s,%s,%s,%s,%s)
+                                ON CONFLICT DO NOTHING
+                                """,
+                                position_rows,
+                            )
+                        if rebalance_rows:
+                            self.db.execute_many_safe(
+                                """
+                                INSERT INTO Portfolio_Transactions (
+                                    Comb_Id, Stock_Id, Prev_Weight, Target_Weight,
+                                    Price, Cash_Value, Status, Transaction_Time, Notes
+                                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                                ON CONFLICT DO NOTHING
+                                """,
+                                rebalance_rows,
+                            )
+                        if bool(getattr(config, "ENABLE_PORTFOLIO_COMMENTS", False)) and comment_rows:
+                            self.db.execute_many_safe(
+                                """
+                                INSERT INTO Portfolio_Comments (
+                                    Status_Id, Comb_Id, User_Id, Content, Publish_Time, Like_Count, Reply_Count, Forward_Count
+                                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                                ON CONFLICT (Status_Id) DO NOTHING
+                                """,
+                                comment_rows,
+                            )
+
+                    # Try to process the "default" sub-tab list first (sometimes switching to the active tab won't trigger a new request).
+                    active_tab_name = None
+                    default_build_or_collection = 0
+                    try:
+                        active_el = tab.ele(
+                            'xpath://*[@id="app"]//a[contains(@data-analytics-data,"sub_tab") and contains(@class,"active")]',
+                            timeout=0.8,
+                        )
+                        if not active_el:
+                            active_el = tab.ele('xpath://*[@id="app"]//a[contains(@class,"active")]', timeout=0.6)
+                        active_text = ((active_el.text or "").strip() if active_el else "")
+                        if "关注" in active_text or "收藏" in active_text:
+                            active_tab_name = "关注的组合"
+                            default_build_or_collection = 1
+                        elif "创建" in active_text:
+                            active_tab_name = "创建的组合"
+                            default_build_or_collection = 0
+                    except Exception:
+                        pass
+
+                    initial_ok = False
+                    initial_deadline = time.time() + 3.0
+                    while time.time() < initial_deadline:
+                        res = tab.listen.wait(timeout=0.8)
+                        if not res:
+                            continue
+                        data = res.response.body
+                        if not data:
+                            continue
+                        payload = SpiderTools.decode_response(res) or data
+                        iterator = _extract_portfolios(payload)
+                        if iterator:
+                            _process_iterator(iterator, default_build_or_collection)
+                            initial_ok = True
+                            break
+
+                    # Drain remaining listen queue to better align response with the click below.
+                    try:
+                        drain_deadline = time.time() + 0.4
+                        while time.time() < drain_deadline:
+                            if not tab.listen.wait(timeout=0.1):
+                                break
+                    except Exception:
+                        pass
+
+                    click_tabs = sub_tabs
+                    if initial_ok and active_tab_name:
+                        click_tabs = [(n, e) for (n, e) in sub_tabs if n != active_tab_name]
+
+                    # Click each sub tab and process data from API.
+                    for tab_name, tab_ele in click_tabs:
+                        try:
+                            # Drain queue for this click.
+                            try:
+                                drain_deadline = time.time() + 0.3
+                                while time.time() < drain_deadline:
+                                    if not tab.listen.wait(timeout=0.1):
+                                        break
+                            except Exception:
+                                pass
+                            tab_ele.click(by_js=True)
+                        except Exception:
+                            continue
+
+                        click_deadline = time.time() + 6
+                        while time.time() < click_deadline:
+                            res = tab.listen.wait(timeout=1.0)
+                            if not res:
+                                continue
+                            data = res.response.body
+                            if not data:
+                                continue
+                            payload = SpiderTools.decode_response(res) or data
+                            iterator = _extract_portfolios(payload)
+                            if iterator:
+                                # Build_Or_Collection: 1 means "关注/收藏" in original code.
+                                build_or_collection = 1 if tab_name == "关注的组合" else 0
+                                _process_iterator(iterator, build_or_collection)
+                                break
+
+                    # Fallback: if we still didn't get any portfolio list, try to process whatever comes in within time window.
+                    if not processed_symbols:
+                        while time.time() < end_time:
+                            res = tab.listen.wait(timeout=1.0)
+                            if not res:
+                                continue
+                            data = res.response.body
+                            if not data:
+                                continue
+                            payload = SpiderTools.decode_response(res) or data
+                            iterator = _extract_portfolios(payload)
+                            if iterator:
+                                _process_iterator(iterator, default_build_or_collection=default_build_or_collection)
+                                break
 
             except Exception as e:
                 print(f"error in step2 in portfolio:{e}")
@@ -705,9 +844,9 @@ class XueqiuSpider:
                 ai_backlog = self.db.get_unanalyzed_count()
                 print(f"\n>>> [循环] 目标:{current_targets}/{config.TARGET_GOAL} | 用户库:{current_users}/{config.FOCUS_COUNT_LIMIT} | AI积压:{ai_backlog}")
                 
-                self.step3_batch_mine()
-                self.step2_batch_filter()
                 self.step1_batch_scan()
+                self.step2_batch_filter()
+                self.step3_batch_mine()
                 time.sleep(2)
 
         except KeyboardInterrupt:

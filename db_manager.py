@@ -259,6 +259,36 @@ class DBManager:
             (f"COMMENTS_LAST_CRAWLED_{user_id}", ts_str),
         )
 
+    # === Raw_Statuses helpers (resume / avoid re-crawl) ===
+
+    def get_user_raw_statuses_count(self, user_id):
+        if not user_id:
+            return 0
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT count(*) FROM Raw_Statuses WHERE User_Id = %s", (user_id,))
+                return int(cur.fetchone()[0] or 0)
+
+    def get_user_raw_oldest_created_at(self, user_id):
+        """Return oldest Created_At (TEXT) for a user, or None."""
+        if not user_id:
+            return None
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT MIN(Created_At) FROM Raw_Statuses WHERE User_Id = %s", (user_id,))
+                row = cur.fetchone()
+                return row[0] if row and row[0] else None
+
+    def get_user_raw_newest_created_at(self, user_id):
+        """Return newest Created_At (TEXT) for a user, or None."""
+        if not user_id:
+            return None
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT MAX(Created_At) FROM Raw_Statuses WHERE User_Id = %s", (user_id,))
+                row = cur.fetchone()
+                return row[0] if row and row[0] else None
+
     def get_target_count(self):
         with self._get_conn() as conn:
             with conn.cursor() as cur:

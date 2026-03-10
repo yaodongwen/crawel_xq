@@ -17,6 +17,12 @@ PG_PASSWORD = "123123"
 PG_POOL_MIN = 1
 PG_POOL_MAX = 10
 
+# === Slider / Risk-control handling ===
+# 如果误判滑块导致 safe_action 卡循环，可临时打开调试查看原因：
+SLIDER_DEBUG = True
+# 避免无限循环刷新的上限
+SLIDER_MAX_REFRESHES = 5
+
 # === 系统切换配置 ===
 # 可选: "mac" 或 "windows"
 OS_TYPE = "windows"
@@ -86,6 +92,14 @@ PORTFOLIO_CACHE_HOURS = 3
 
 # 如果触发风控/被封（常见表现：405），暂停的秒数
 BLOCK_SLEEP_SECONDS = 600
+
+# 输出 405 触发时的 url/title，便于排查误判
+BLOCK_DEBUG = True
+
+# 组合页签调试：输出“创建/关注/收藏”等子页签的文本，便于修正选择器
+PORTFOLIO_TAB_DEBUG = True
+# 调试时最多输出多少个子页签候选 a 标签（避免刷屏）
+PORTFOLIO_TAB_DEBUG_MAX = 20
 
 API = {
     'FOCUS': 'friendships/groups/members.json',
