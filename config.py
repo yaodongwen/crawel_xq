@@ -23,6 +23,25 @@ SLIDER_DEBUG = True
 # 避免无限循环刷新的上限
 SLIDER_MAX_REFRESHES = 5
 
+# === Raw_Statuses staging policy ===
+# Raw_Statuses is a staging/queue table for AI processing. For large datasets, keeping all processed raw text
+# will bloat storage significantly. Enable the flag below to delete Raw_Statuses rows after AI processed them.
+# IMPORTANT: This is destructive. Keep it False until you've verified `Value_Comments` is being populated as expected.
+DELETE_ANALYZED_RAW_STATUSES = False
+# If True, also delete rows that failed AI processing (Is_Analyzed=2). Usually keep False for debugging/retry.
+DELETE_FAILED_RAW_STATUSES = False
+
+# Step3 "resume" checkpoint: prefer Value_Comments(Publish_Time) to decide where to stop paging (incremental crawl).
+# This avoids the old "crawl older than Raw_Statuses oldest" strategy (which breaks once raw rows are deleted).
+RESUME_BY_VALUE_COMMENTS = True
+
+# Max new Raw_Statuses rows to enqueue per user per run (safety cap).
+# Set to None here; we will default it to ARTICLE_COUNT_LIMIT after that constant is defined below.
+STEP3_MAX_NEW_RAW_PER_USER = None
+
+# Step3 debug: print detailed checkpoint sources (Value_Comments vs System_Meta).
+STEP3_DEBUG_CHECKPOINTS = False
+
 # === 系统切换配置 ===
 # 可选: "mac" 或 "windows"
 OS_TYPE = "windows"
@@ -62,8 +81,13 @@ ARTICLE_COUNT_LIMIT = 3000
 FOCUS_COUNT_LIMIT = 300000
 TARGET_GOAL = 10000
 
+# Default max new raw rows per user per run.
+if STEP3_MAX_NEW_RAW_PER_USER is None:
+    STEP3_MAX_NEW_RAW_PER_USER = ARTICLE_COUNT_LIMIT
+
 # === 【新增】流水线批次大小 ===
 PIPELINE_BATCH_SIZE = 10 # 意思是：Step 1 找到 10 个优质用户就停下来，转而去跑 Step 2
+
 
 CACHE_DAYS = 21           
 # AI_MODEL_NAME = "qwen2.5:1.5b" 
@@ -90,8 +114,37 @@ MIN_COMMENTS = 20
 # 仅通过列表接口补充/更新基础字段；超过时间再做增量更新（天）。
 PORTFOLIO_CACHE_HOURS = 3
 
+# 仅对“新组合”（库里不存在）抓取详情页；已有组合只做列表层更新/关注关系落库。
+# 开启会更快，但会减少已有组合的持仓/调仓更新频率（需要的话关掉或调大 PORTFOLIO_CACHE_HOURS）。
+PORTFOLIO_DETAIL_ONLY_IF_NEW = False
+
+# Step2 组合列表等待时长（秒）：等待 `portfolio/stock/list.json` 等响应
+PORTFOLIO_LIST_WAIT_SECONDS = 6
+# Step2 子页签等待时长（秒）：等待“创建/关注”子页签渲染出来
+PORTFOLIO_SUBTAB_WAIT_SECONDS = 5
+# Step2 点击子页签后等待时长（秒）：等待该子页签触发新的列表响应
+PORTFOLIO_CLICK_WAIT_SECONDS = 6
+
 # 如果触发风控/被封（常见表现：405），暂停的秒数
 BLOCK_SLEEP_SECONDS = 600
+
+# 任一 worker 触发 405 时写入全局退避文件，避免其它 worker 继续打导致更严重风控
+GLOBAL_BLOCK_ON_405 = True
+
+# 405 时不在 safe_action 内部睡眠，而是抛出全局退避信号：关闭浏览器等待，到点后再重启浏览器继续跑
+HIBERNATE_ON_405 = True
+
+# WAF/滑块验证触发时的退避策略（不尝试自动绕过验证）。
+WAF_SLEEP_SECONDS = BLOCK_SLEEP_SECONDS
+HIBERNATE_ON_WAF = True
+SLIDER_SLEEP_SECONDS = BLOCK_SLEEP_SECONDS
+HIBERNATE_ON_SLIDER = True
+
+# 长文补全：优先使用 JSON API（推荐），避免打开 https://xueqiu.com/{uid}/{id} 详情页触发 405/滑块
+LONG_ARTICLE_API_ONLY = True
+
+# Step1 扫描关注列表：最多翻多少页（0 表示不限制；建议在风控较严时设一个上限）
+FOLLOW_SCAN_MAX_PAGES = 50
 
 # 输出 405 触发时的 url/title，便于排查误判
 BLOCK_DEBUG = True
@@ -143,6 +196,7 @@ SQL_CREATE_TABLES = [
         Friends_Count INTEGER,
         Followers_Count INTEGER,
         Description TEXT,
+        Get_Follow INTEGER DEFAULT 0,
         Last_Updated TEXT
     );
     """,

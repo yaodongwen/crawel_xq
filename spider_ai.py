@@ -25,6 +25,10 @@ class AIWorker:
         dict_file=None,
         on_saved=None,
         batch_size=None,
+        stop_when_empty=False,
+        max_statuses=None,
+        max_seconds=None,
+        progress_every=None,
     ):
         self._db = db
         self._is_main_job_finished_fn = is_main_job_finished_fn
@@ -32,6 +36,10 @@ class AIWorker:
 
         self._dict_file = dict_file or getattr(config, "STOCK_ALIASES_JSON", None)
         self._batch_size = int(batch_size or getattr(config, "AI_BATCH_SIZE", 8))
+        self._stop_when_empty = bool(stop_when_empty)
+        self._max_statuses = int(max_statuses) if max_statuses is not None else None
+        self._max_seconds = int(max_seconds) if max_seconds is not None else None
+        self._progress_every = int(progress_every) if progress_every is not None else None
 
         self._device = None
         self._automaton = None
@@ -94,10 +102,25 @@ class AIWorker:
     def run(self):
         self._ensure_ready()
 
+        started = time.time()
+        processed_statuses = 0
+
+        def _should_stop():
+            if self._max_seconds is not None and self._max_seconds > 0:
+                if time.time() - started >= float(self._max_seconds):
+                    return True
+            if self._max_statuses is not None and self._max_statuses > 0:
+                if processed_statuses >= int(self._max_statuses):
+                    return True
+            return False
+
         while True:
+            if _should_stop():
+                break
+
             raw_batch = self._db.get_unanalyzed_raw_data(limit=self._batch_size)
             if not raw_batch:
-                if self._is_main_job_finished_fn():
+                if self._stop_when_empty or self._is_main_job_finished_fn():
                     break
                 time.sleep(2)
                 continue
@@ -105,6 +128,8 @@ class AIWorker:
             # Expand each raw status into slices (masked texts). We later aggregate back to 1 score per status_id.
             candidates = []
             skipped_sids = set()
+            ok_sids = set()
+            failed_sids = set()
 
             for row in raw_batch:
                 sid = row.get("status_id")
@@ -149,13 +174,24 @@ class AIWorker:
             for sid in skipped_sids:
                 try:
                     self._db.mark_raw_as_analyzed(sid, 1)
+                    processed_statuses += 1
+                    ok_sids.add(sid)
                 except Exception:
                     pass
 
             if not candidates:
+                # Optional: delete the skipped raw rows after processing.
+                try:
+                    if ok_sids and bool(getattr(config, "DELETE_ANALYZED_RAW_STATUSES", False)):
+                        self._db.delete_raw_statuses_by_ids(list(ok_sids))
+                except Exception:
+                    pass
                 continue
 
             try:
+                # Unique sids in this batch (for progress / max_statuses caps).
+                batch_sids = {c["sid"] for c in candidates if c.get("sid") is not None}
+
                 texts = [c["text"] for c in candidates]
 
                 # 1) Intent classification (0/1). Keep label==1.
@@ -234,8 +270,24 @@ class AIWorker:
                                 break
 
                 # Mark all processed statuses as analyzed.
-                for sid in {c["sid"] for c in candidates}:
+                for sid in batch_sids:
                     self._db.mark_raw_as_analyzed(sid, 1)
+                    processed_statuses += 1
+                    ok_sids.add(sid)
+
+                # Optional: delete processed raw rows to keep Raw_Statuses small.
+                try:
+                    if ok_sids and bool(getattr(config, "DELETE_ANALYZED_RAW_STATUSES", False)):
+                        self._db.delete_raw_statuses_by_ids(list(ok_sids))
+                except Exception:
+                    pass
+
+                if self._progress_every and processed_statuses % int(self._progress_every) == 0:
+                    try:
+                        left = int(self._db.get_unanalyzed_count() or 0)
+                    except Exception:
+                        left = -1
+                    print(f">>> [AI] processed={processed_statuses} left={left}")
 
             except Exception as e:
                 print(f"error in AI: {e}")
@@ -243,8 +295,16 @@ class AIWorker:
                 for sid in {c["sid"] for c in candidates}:
                     try:
                         self._db.mark_raw_as_analyzed(sid, 2)
+                        processed_statuses += 1
+                        failed_sids.add(sid)
                     except Exception:
                         pass
+
+                try:
+                    if failed_sids and bool(getattr(config, "DELETE_FAILED_RAW_STATUSES", False)):
+                        self._db.delete_raw_statuses_by_ids(list(failed_sids))
+                except Exception:
+                    pass
 
 
 def run_ai_process(stop_event):

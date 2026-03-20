@@ -9,6 +9,18 @@ from datetime import datetime
 import config
 
 
+class GlobalBackoff(Exception):
+    """Signal a global backoff (e.g., 405/WAF) that should abort current step and sleep/restart safely."""
+
+    def __init__(self, seconds, reason="block"):
+        try:
+            self.seconds = int(seconds)
+        except Exception:
+            self.seconds = 0
+        self.reason = reason
+        super().__init__(f"{reason}:{self.seconds}")
+
+
 class SpiderTools:
     """Utilities shared across spiders.
 
@@ -35,6 +47,40 @@ class SpiderTools:
     @staticmethod
     def random_sleep(min_s=1.0, max_s=2.0):
         time.sleep(random.uniform(min_s, max_s))
+
+    @staticmethod
+    def write_global_block_file(seconds):
+        """Write a global backoff deadline to a shared file (best-effort).
+
+        This is used to coordinate multiple processes (or just leave a breadcrumb for operators).
+        """
+        try:
+            s = int(seconds)
+        except Exception:
+            s = 0
+        if s <= 0:
+            return False
+        try:
+            path = getattr(config, "GLOBAL_BLOCK_FILE", None)
+        except Exception:
+            path = None
+        if not path:
+            try:
+                base = getattr(config, "BASE_DIR", os.path.dirname(os.path.abspath(__file__)))
+            except Exception:
+                base = os.path.dirname(os.path.abspath(__file__))
+            path = os.path.join(base, "data", "global_block_until.txt")
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        except Exception:
+            pass
+        try:
+            until = datetime.fromtimestamp(time.time() + s).strftime("%Y-%m-%d %H:%M:%S")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(until)
+            return True
+        except Exception:
+            return False
 
     @staticmethod
     def _try_ele(root, locator, timeout=0.1):
@@ -172,6 +218,16 @@ class SpiderTools:
                 )
 
             sleep_s = int(getattr(config, "BLOCK_SLEEP_SECONDS", 600))
+            # Propagate global backoff ASAP (so other workers stop immediately).
+            try:
+                if bool(getattr(config, "GLOBAL_BLOCK_ON_405", False)) and sleep_s > 0:
+                    cls.write_global_block_file(sleep_s)
+            except Exception:
+                pass
+
+            # Prefer hibernation (close browser & wait at a safe boundary) over sleeping inside safe_action.
+            if bool(getattr(config, "HIBERNATE_ON_405", False)) and sleep_s > 0:
+                raise GlobalBackoff(sleep_s, reason="405")
             # Allow disabling long sleeps in testing.
             if sleep_s <= 0:
                 print("\n>>> [严重] 触发405（已关闭自动等待），跳过等待。")
@@ -196,54 +252,103 @@ class SpiderTools:
             return False
 
     @classmethod
+    def check_waf(cls, driver):
+        """Detect WAF-style block pages and trigger global backoff.
+
+        Xueqiu sometimes returns an interstitial page like:
+        "很抱歉...您的访问被阻断...请求ID..."
+        """
+        try:
+            tab = driver.latest_tab
+        except Exception:
+            return False
+        try:
+            title = tab.title or ""
+            url = tab.url or ""
+        except Exception:
+            title, url = "", ""
+
+        hints = (
+            "访问被阻断",
+            "您的访问被阻断",
+            "安全威胁",
+            "请求ID",
+            "被阻断",
+            "Access Denied",
+            "Request blocked",
+        )
+
+        title_hit = any(h in title for h in hints)
+        url_hit = any(h.lower() in (url or "").lower() for h in ("waf", "deny", "blocked"))
+        text_hit = False
+        if not (title_hit or url_hit):
+            try:
+                # Only probe DOM when not already obvious from title/url (avoid overhead).
+                text_hit = any(cls._is_displayed(cls._try_ele(tab, f"text:{h}", timeout=0.1)) for h in hints)
+            except Exception:
+                text_hit = False
+
+        if not (title_hit or url_hit or text_hit):
+            return False
+
+        sleep_s = int(getattr(config, "WAF_SLEEP_SECONDS", getattr(config, "BLOCK_SLEEP_SECONDS", 600)))
+        if sleep_s <= 0:
+            print("\n>>> [严重] 触发访问阻断（WAF）（已关闭自动等待），跳过等待。")
+            return True
+
+        now = time.time()
+        last = float(getattr(cls, "_last_waf_sleep_ts", 0.0))
+        if now - last < max(30.0, sleep_s * 0.8):
+            return True
+        cls._last_waf_sleep_ts = now
+
+        mins = max(1, int(round(sleep_s / 60)))
+        # Prefer hibernation (close browser & wait at a safe boundary) when enabled.
+        if bool(getattr(config, "HIBERNATE_ON_WAF", False)):
+            raise GlobalBackoff(sleep_s, reason="WAF")
+        print(f"\n>>> [严重] 触发访问阻断（WAF），暂停 {mins} 分钟...")
+        time.sleep(sleep_s)
+        try:
+            tab.refresh()
+        except Exception:
+            pass
+        return True
+
+    @classmethod
     def safe_action(cls, driver):
-        # 405 block takes precedence: don't try slider when we're rate-limited/blocked.
+        # WAF block takes precedence.
+        if cls.check_waf(driver):
+            return
+        # 405 block takes precedence.
         if cls.check_405(driver):
             return
-        max_retries = 10
-        count = 0
-        refreshes = 0
-        max_refreshes = int(getattr(config, "SLIDER_MAX_REFRESHES", 3))
-        last_reason = None
-        debug = bool(getattr(config, "SLIDER_DEBUG", False))
 
-        while True:
-            if cls.check_405(driver):
-                return
-            has, reason = cls.detect_slider(driver)
-            if not has:
-                return
+        has, reason = cls.detect_slider(driver)
+        if not has:
+            return
 
-            # If we didn't find the actual slider handle, don't loop forever.
-            # (Most of these cases are either false positives or non-slider verification pages.)
-            if reason != "aliyun_slider":
-                if debug:
-                    print(
-                        f">>> [滑块] 非滑块验证页({reason})，跳过自动拖动 | url={getattr(driver.latest_tab, 'url', '')}"
-                    )
-                return
+        try:
+            url = getattr(driver.latest_tab, "url", "") or ""
+        except Exception:
+            url = ""
 
-            count += 1
-            if debug and reason != last_reason:
-                last_reason = reason
-                print(f">>> [滑块] 检测到验证页: {reason} | url={getattr(driver.latest_tab, 'url', '')}")
-            if count > 1:
-                print(f">>> [滑块] 第 {count} 次尝试...")
+        # Don't attempt to automatically bypass verification challenges.
+        print(f">>> [滑块] 检测到验证页: {reason} | url={url}")
 
-            cls.solve_slider(driver)
-            time.sleep(2)
-            if count >= max_retries:
-                print(">>> [滑块] 尝试次数过多，刷新页面...")
-                refreshes += 1
-                try:
-                    driver.latest_tab.refresh()
-                except Exception:
-                    pass
-                time.sleep(3)
-                count = 0
-                if refreshes >= max_refreshes:
-                    print(f">>> [滑块] 刷新仍未解除验证，停止重试（{refreshes}/{max_refreshes}）。")
-                    return
+        sleep_s = int(getattr(config, "SLIDER_SLEEP_SECONDS", getattr(config, "BLOCK_SLEEP_SECONDS", 600)))
+        if sleep_s <= 0:
+            return
+        if bool(getattr(config, "HIBERNATE_ON_SLIDER", True)):
+            raise GlobalBackoff(sleep_s, reason="slider")
+
+        mins = max(1, int(round(sleep_s / 60)))
+        print(f">>> [滑块] 暂停 {mins} 分钟后重试...")
+        time.sleep(sleep_s)
+        try:
+            driver.latest_tab.refresh()
+        except Exception:
+            pass
+        return
 
     @staticmethod
     def restart_browser(driver, init_browser_fn):
@@ -303,12 +408,26 @@ class SpiderTools:
         if isinstance(body, bytes):
             try:
                 headers = res.response.headers or {}
-                if (
-                    isinstance(headers, dict)
-                    and "content-encoding" in headers
-                    and "gzip" in str(headers["content-encoding"]).lower()
-                ):
-                    body = gzip.decompress(body)
+                enc = None
+                try:
+                    if isinstance(headers, dict):
+                        enc = headers.get("content-encoding") or headers.get("Content-Encoding")
+                except Exception:
+                    enc = None
+                is_gzip = False
+                try:
+                    if enc and "gzip" in str(enc).lower():
+                        is_gzip = True
+                    elif len(body) >= 2 and body[0] == 0x1F and body[1] == 0x8B:
+                        # Some intermediaries omit/alter headers; detect gzip via magic bytes.
+                        is_gzip = True
+                except Exception:
+                    is_gzip = False
+                if is_gzip:
+                    try:
+                        body = gzip.decompress(body)
+                    except Exception:
+                        pass
                 text = body.decode("utf-8", errors="ignore")
                 return _parse_text(text)
             except Exception as e:
@@ -320,3 +439,78 @@ class SpiderTools:
         if verbose:
             print(f"decode_response: unexpected body type: {type(body)}")
         return None
+
+    @staticmethod
+    def response_text_snippet(res, limit=600):
+        """Return a short decoded text snippet for debugging non-JSON responses."""
+        if not res or not hasattr(res, "response") or not hasattr(res.response, "body"):
+            return ""
+        body = res.response.body
+        if body is None:
+            return ""
+        if isinstance(body, (dict, list)):
+            try:
+                s = json.dumps(body, ensure_ascii=False)
+            except Exception:
+                s = str(body)
+            return s[: int(limit)]
+        if isinstance(body, str):
+            return body.strip()[: int(limit)]
+        if isinstance(body, bytes):
+            try:
+                headers = res.response.headers or {}
+                enc = None
+                try:
+                    if isinstance(headers, dict):
+                        enc = headers.get("content-encoding") or headers.get("Content-Encoding")
+                except Exception:
+                    enc = None
+                is_gzip = False
+                try:
+                    if enc and "gzip" in str(enc).lower():
+                        is_gzip = True
+                    elif len(body) >= 2 and body[0] == 0x1F and body[1] == 0x8B:
+                        is_gzip = True
+                except Exception:
+                    is_gzip = False
+                if is_gzip:
+                    try:
+                        body = gzip.decompress(body)
+                    except Exception:
+                        pass
+                return body.decode("utf-8", errors="ignore").strip()[: int(limit)]
+            except Exception:
+                return ""
+        return str(body).strip()[: int(limit)]
+
+    @classmethod
+    def response_looks_blocked(cls, res):
+        """Heuristic: detect HTML/WAF block responses where JSON is expected."""
+        if not res or not hasattr(res, "response"):
+            return False, None
+        try:
+            url = getattr(getattr(res, "request", None), "url", "") or ""
+        except Exception:
+            url = ""
+
+        snippet = cls.response_text_snippet(res, limit=1200)
+        if not snippet:
+            return False, None
+
+        hints = (
+            "访问被阻断",
+            "您的访问被阻断",
+            "安全威胁",
+            "请求ID",
+            "Access Denied",
+            "Request blocked",
+            "Not Allowed",
+        )
+        if any(h in snippet for h in hints):
+            return True, "WAF"
+
+        # Some blocks are plain HTML without the above keywords; keep this conservative.
+        if snippet[:1] == "<" and "xueqiu.com" in url and ("captcha" in snippet.lower() or "verify" in snippet.lower()):
+            return True, "captcha"
+
+        return False, None

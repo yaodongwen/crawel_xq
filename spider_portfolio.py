@@ -5,7 +5,7 @@ import re
 from lxml import etree
 import config
 from DrissionPage import ChromiumPage, ChromiumOptions
-from spider_tools import SpiderTools
+from spider_tools import SpiderTools, GlobalBackoff
 
 class SpiderPortfolioMixin:
     def __init__(self):
@@ -65,6 +65,79 @@ class PortfolioCrawler(SpiderPortfolioMixin):
     def __init__(self, init_browser_fn=None):
         # Keep signature compatible with main_spider; use internal browser for detail mining.
         super().__init__()
+        self._detail_tab = None
+
+    def _get_detail_tab(self):
+        """Reuse a single tab for portfolio detail mining to avoid opening many tabs."""
+        try:
+            if self._detail_tab:
+                _ = self._detail_tab.url
+                return self._detail_tab
+        except Exception:
+            self._detail_tab = None
+        try:
+            self._detail_tab = self.driver.latest_tab
+        except Exception:
+            self._detail_tab = None
+        if not self._detail_tab:
+            try:
+                self._detail_tab = self.driver.new_tab()
+            except Exception:
+                self._detail_tab = None
+        return self._detail_tab
+
+    def _parse_holdings_from_tab(self, detail_tab, symbol):
+        """Parse holdings from an already-loaded portfolio detail tab."""
+        results = {"symbol": symbol, "Detailed_Position": []}
+        if not detail_tab:
+            return results
+
+        weight_list_container = self._try_ele(detail_tab, 'xpath://div[contains(@class, "weight-list")]', timeout=5)
+        if not weight_list_container:
+            return results
+
+        all_items = weight_list_container.eles('xpath:./*')
+        current_segment = None
+        for item in all_items:
+            tag_class = item.attr('class')
+            if not tag_class:
+                continue
+
+            if 'segment' in tag_class:
+                seg_name = self._try_text(item, 'xpath:.//span[contains(@class, "segment-name")]', timeout=1) or ''
+                seg_prop = self._try_text(
+                    item,
+                    'xpath:.//span[contains(@class, "segment-weight") and contains(@class, "weight")]',
+                    timeout=1,
+                ) or ''
+                current_segment = {"category_name": seg_name, "proportion": seg_prop, "stocks": []}
+                results["Detailed_Position"].append(current_segment)
+                continue
+
+            if 'stock' in tag_class and current_segment is not None:
+                stock_symbol = None
+                link = self._try_ele(item, 'xpath:.//a[contains(@href, "/S/")]', timeout=0.5)
+                try:
+                    href = link.attr("href") if link else ""
+                except Exception:
+                    href = ""
+                if href:
+                    if "/S/" in href:
+                        stock_symbol = href.split("/S/", 1)[1]
+                    elif href.startswith("S/"):
+                        stock_symbol = href.split("S/", 1)[1]
+                    if stock_symbol:
+                        stock_symbol = stock_symbol.split("?", 1)[0].strip("/").strip()
+                results["Detailed_Position"][-1]["stocks"].append(
+                    {
+                        "symbol": stock_symbol,
+                        "name": self._try_text(item, 'xpath:.//div[contains(@class, "name")]', timeout=1) or "",
+                        "price": self._try_text(item, 'xpath:.//div[contains(@class, "price")]', timeout=1) or "",
+                        "weight": self._try_text(item, 'xpath:.//span[contains(@class, "stock-weight")]', timeout=1)
+                        or "",
+                    }
+                )
+        return results
 
     @staticmethod
     def _first_nonempty_line(text):
@@ -142,10 +215,11 @@ class PortfolioCrawler(SpiderPortfolioMixin):
         
         try:
             url = f"https://xueqiu.com/P/{symbol}"
-            # 在访问页面前开启监听调仓接口
-            self.driver.listen.start('rebalancing/history.json')
-            
-            detail_tab = self.driver.new_tab(url)
+            # 持仓解析不需要监听接口，避免额外资源占用
+            detail_tab = self._get_detail_tab()
+            if not detail_tab:
+                return results
+            detail_tab.get(url)
             print(f"正在访问组合: {symbol}")
             SpiderTools.safe_action(self.driver)
 
@@ -198,13 +272,12 @@ class PortfolioCrawler(SpiderPortfolioMixin):
                             "weight": self._try_text(item, 'xpath:.//span[contains(@class, "stock-weight")]', timeout=1) or ""
                         })
 
-            detail_tab.close()
             return results
 
+        except GlobalBackoff:
+            raise
         except Exception as e:
             print(f"⚠️ 抓取失败 {symbol}: {e}")
-            if self.driver.tabs_count > 1:
-                self.driver.latest_tab.close()
             return results
 
 
@@ -221,10 +294,16 @@ class PortfolioCrawler(SpiderPortfolioMixin):
         
         try:
             url = f"https://xueqiu.com/P/{symbol}"
-            detail_tab = self.driver.new_tab()
+            detail_tab = self._get_detail_tab()
+            if not detail_tab:
+                return results
             
             # 1. 启动监听器 (合并监听)
             # 目前只抓取调仓（JSON）；timeline 返回 HTML 片段，容易触发 decode_response 的 JSON 解析错误。
+            try:
+                detail_tab.listen.stop()
+            except Exception:
+                pass
             detail_tab.listen.start('rebalancing/history.json')
             detail_tab.get(url)
             SpiderTools.safe_action(self.driver)
@@ -278,7 +357,7 @@ class PortfolioCrawler(SpiderPortfolioMixin):
             results.update(self._portfolio_status(symbol, detail_tab))
 
             # 6. 仓位信息 --- 【核心修正：JS 中使用 .trim()】 ---
-            results["Detailed_Position"] = self.get_portfolio_holdings(symbol)["Detailed_Position"]
+            results["Detailed_Position"] = self._parse_holdings_from_tab(detail_tab, symbol)["Detailed_Position"]
 
             # 7. 触发滚动与点击监听
             detail_tab.scroll.down(1000)
@@ -299,13 +378,17 @@ class PortfolioCrawler(SpiderPortfolioMixin):
                 if decoded is not None:
                     results["rebalances"] = decoded
 
-            detail_tab.close()
-
+        except GlobalBackoff:
+            raise
         except Exception as e:
             print(f"⚠️ 抓取失败 {symbol}: {e}")
-            if self.driver.tabs_count > 1:
-                self.driver.latest_tab.close()
-        
+        finally:
+            try:
+                if detail_tab:
+                    detail_tab.listen.stop()
+            except Exception:
+                pass
+         
         return results
 
 if __name__ == "__main__":

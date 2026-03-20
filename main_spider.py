@@ -9,7 +9,7 @@ from db_manager import DBManager
 
 from spider_ai import AIWorker, run_ai_process
 from spider_comments import CommentsCrawler
-from spider_tools import SpiderTools
+from spider_tools import SpiderTools, GlobalBackoff
 from spider_portfolio import PortfolioCrawler
 
 
@@ -58,6 +58,39 @@ class XueqiuSpider:
     def _on_ai_saved(self):
         self.total_ai_saved += 1
 
+    def _hibernate_and_restart(self, seconds, reason="block"):
+        try:
+            s = int(seconds)
+        except Exception:
+            s = 0
+        if s <= 0:
+            return
+        mins = max(1, int(round(s / 60)))
+        print(f"\n>>> [严重] 触发{reason}，关闭浏览器等待 {mins} 分钟...")
+        try:
+            if self.driver:
+                self.driver.quit()
+        except Exception:
+            pass
+        try:
+            # Portfolio crawler uses its own driver instance.
+            if getattr(self, "_portfolio_crawler", None) and getattr(self._portfolio_crawler, "driver", None):
+                self._portfolio_crawler.driver.quit()
+        except Exception:
+            pass
+
+        deadline = time.time() + s
+        while time.time() < deadline and not self.stop_event.is_set():
+            time.sleep(min(60, max(1, int(deadline - time.time()))))
+
+        # Restart browsers (reuse user_data_path so session usually persists).
+        self.driver = self._init_browser()
+        try:
+            self.driver.get("https://xueqiu.com/")
+        except Exception:
+            pass
+        self._portfolio_crawler = PortfolioCrawler(init_browser_fn=self._init_browser)
+
     def global_ai_worker(self):
         self._ai_worker.run()
 
@@ -76,97 +109,140 @@ class XueqiuSpider:
         if current_users_count >= config.FOCUS_COUNT_LIMIT: return
 
         print(f"\n=== Step 1: 寻找新用户 (目标新增: {config.PIPELINE_BATCH_SIZE} 人) ===")
-        if self.db.is_user_scanned(self.seed_id): current_source_id = None
-        else: current_source_id = self.seed_id
-        
-        if not current_source_id:
-            next_user = self.db.get_next_source_user()
-            if not next_user: print(">>> 无可用宿主"); return
+        # 从 High_quality_users 里找 Get_Follow=0 的用户作为“宿主”，扫描其关注列表。
+        # 若为空则用种子宿主兜底（并确保种子在 High_quality_users 里，Get_Follow=0）。
+        next_user = self.db.get_next_follow_scan_user()
+        if not next_user:
+            self.db.ensure_high_quality_user(self.seed_id, user_name="seed", get_follow=0)
+            current_source_id = self.seed_id
+            print(f">>> 无可用宿主，使用种子宿主: {current_source_id}")
+        else:
             current_source_id = next_user["user_id"]
-            print(f">>> 切换宿主: {next_user['user_name']}")
-        else: print(f">>> 继续宿主: {current_source_id}")
+            print(f">>> 扫描宿主关注列表: {next_user.get('user_name')}")
 
         tab = self.driver.latest_tab
         new_hq_added_in_this_batch = 0
         
         try:
+            did_scan_any_page = False
+            page_count = 0
+            max_pages = int(getattr(config, "FOLLOW_SCAN_MAX_PAGES", 0) or 0)
+
+            tab.listen.start(config.API['FOCUS'])
             tab.get(f"https://xueqiu.com/u/{current_source_id}")
             time.sleep(2)
             if "follow" not in tab.url:
                 btn = tab.ele('tag:a@@href=#/follow', timeout=3)
-                if btn: btn.click()
-                else: 
-                    if not self.stop_event.is_set():
-                        self.db.mark_user_as_scanned(current_source_id)
+                if btn:
+                    btn.click(by_js=True)
+                    SpiderTools.random_sleep()
+                else:
+                    print(">>> ⚠️ 无法进入关注列表页（可能被风控/页面结构变化），稍后重试")
                     return
-            
-            tab.listen.start(config.API['FOCUS'])
-            page_count = 0
-            
+
+            def _extract_users(res):
+                try:
+                    payload = SpiderTools.decode_response(res)
+                except Exception:
+                    payload = None
+                if not payload and res and hasattr(res, "response"):
+                    payload = getattr(res.response, "body", None)
+                if isinstance(payload, dict):
+                    if "users" in payload:
+                        return payload.get("users") or []
+                    data = payload.get("data")
+                    if isinstance(data, dict) and "users" in data:
+                        return data.get("users") or []
+                return None
+
+            # 首包（第一页）
+            res = tab.listen.wait(timeout=8)
+            users = _extract_users(res)
+            if users is None:
+                print(">>> ⚠️ 关注列表首包未获取到 users（可能被风控/超时），稍后重试")
+                return
+            did_scan_any_page = True
+
             while True:
                 SpiderTools.safe_action(self.driver)
-                if new_hq_added_in_this_batch >= config.PIPELINE_BATCH_SIZE: break 
-
-                next_btn = tab.ele('.pagination__next', timeout=3)
-                if not next_btn or not next_btn.states.is_displayed: 
-                    if not self.stop_event.is_set():
-                        self.db.mark_user_as_scanned(current_source_id)
+                if new_hq_added_in_this_batch >= config.PIPELINE_BATCH_SIZE:
                     break
-                
-                next_btn.click(by_js=True)
-                SpiderTools.random_sleep()
-                
-                res = tab.listen.wait(timeout=6)
-                if res and 'users' in res.response.body:
-                    users = res.response.body['users']
-                    new_users = []
-                    new_hq = []
-                    now_str = SpiderTools.get_now_str()
 
-                    for u in users:
-                        uid = u.get('id')
-                        if uid in self.existing_ids: continue
-                        self.existing_ids.add(uid)
-                        
-                        row = (uid, u.get('screen_name'), u.get('status_count', 0),
-                               u.get('friends_count', 0), u.get('followers_count', 0), 
-                               u.get('description', ''), now_str) 
-                        new_users.append(row)
-                        
-                        if int(u.get('followers_count', 0)) > config.MIN_FOLLOWERS \
-                              and int(u.get('status_count', 0)) > config.MIN_COMMENTS: 
-                            hq_row = list(row); hq_row[-1] = None 
-                            new_hq.append(tuple(hq_row))
-                            new_hq_added_in_this_batch += 1
-                    
-                    if new_users:
-                        self.db.execute_many_safe(
-                            """
-                            INSERT INTO users (
-                                User_Id, User_Name, Comments_Count, Friends_Count, Followers_Count, Description, Last_Updated
-                            ) VALUES (%s,%s,%s,%s,%s,%s,%s)
-                            ON CONFLICT (User_Id) DO NOTHING
-                            """,
-                            new_users,
-                        )
-                    if new_hq:
-                        self.db.execute_many_safe(
-                            """
-                            INSERT INTO High_quality_users (
-                                User_Id, User_Name, Comments_Count, Friends_Count, Followers_Count, Description, Last_Updated
-                            ) VALUES (%s,%s,%s,%s,%s,%s,%s)
-                            ON CONFLICT (User_Id) DO NOTHING
-                            """,
-                            new_hq,
-                        )
-                    print(f"    [扫描] 本轮新增优质: {new_hq_added_in_this_batch}/{config.PIPELINE_BATCH_SIZE}", end='\r')
+                new_users = []
+                new_hq = []
+                now_str = SpiderTools.get_now_str()
+
+                for u in (users or []):
+                    uid = u.get('id')
+                    if uid in self.existing_ids:
+                        continue
+                    self.existing_ids.add(uid)
+
+                    row = (uid, u.get('screen_name'), u.get('status_count', 0),
+                           u.get('friends_count', 0), u.get('followers_count', 0),
+                           u.get('description', ''), now_str)
+                    new_users.append(row)
+
+                    if int(u.get('followers_count', 0)) > config.MIN_FOLLOWERS and int(u.get('status_count', 0)) > config.MIN_COMMENTS:
+                        # Get_Follow=0 => 后续会作为宿主继续扫描关注列表
+                        new_hq.append((
+                            uid, u.get('screen_name'), u.get('status_count', 0),
+                            u.get('friends_count', 0), u.get('followers_count', 0),
+                            u.get('description', ''), 0, None
+                        ))
+                        new_hq_added_in_this_batch += 1
+
+                if new_users:
+                    self.db.execute_many_safe(
+                        """
+                        INSERT INTO users (
+                            User_Id, User_Name, Comments_Count, Friends_Count, Followers_Count, Description, Last_Updated
+                        ) VALUES (%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (User_Id) DO NOTHING
+                        """,
+                        new_users,
+                    )
+                if new_hq:
+                    self.db.execute_many_safe(
+                        """
+                        INSERT INTO High_quality_users (
+                            User_Id, User_Name, Comments_Count, Friends_Count, Followers_Count, Description, Get_Follow, Last_Updated
+                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (User_Id) DO NOTHING
+                        """,
+                        new_hq,
+                    )
+                print(f"    [扫描] 本轮新增优质: {new_hq_added_in_this_batch}/{config.PIPELINE_BATCH_SIZE}", end='\r')
 
                 page_count += 1
-                if page_count > 20: break 
-            tab.listen.stop()
+                if max_pages and page_count >= max_pages:
+                    print("\n>>> ⚠️ 关注列表页数过多，已达上限，先标记完成（可调整 FOLLOW_SCAN_MAX_PAGES）")
+                    break
+
+                next_btn = tab.ele('.pagination__next', timeout=3)
+                if not next_btn or not next_btn.states.is_displayed:
+                    break
+
+                next_btn.click(by_js=True)
+                SpiderTools.random_sleep()
+                res = tab.listen.wait(timeout=8)
+                users = _extract_users(res)
+                if users is None:
+                    break
+                did_scan_any_page = True
+
+            if did_scan_any_page and not self.stop_event.is_set():
+                self.db.mark_high_quality_follow_scanned(current_source_id)
+        except GlobalBackoff:
+            raise
         except Exception as e: 
             print(f"error in step1")
             pass
+        finally:
+            try:
+                tab.listen.stop()
+            except Exception:
+                pass
 
     # ================= Step 2: 批次筛选 =================
 
@@ -222,7 +298,9 @@ class XueqiuSpider:
             try:
                 tab.get(f"https://xueqiu.com/u/{uid}")
                 SpiderTools.random_sleep(1.5, 2.0)
+                stock_listen_started = False
                 tab.listen.start(config.API['STOCK'])
+                stock_listen_started = True
                 
                 stock_btn = tab.ele('tag:a@@href=#/stock', timeout=4)
                 if stock_btn:
@@ -311,14 +389,17 @@ class XueqiuSpider:
                             target_data,
                         )
                         self.target_ids_cache.add(uid)
+            except GlobalBackoff:
+                raise
             except Exception as e:
                 print(f"error in step2:{e}")
 
             finally:
-                try:
-                    tab.listen.stop()
-                except Exception:
-                    print("error in stop listening quote")
+                if stock_listen_started:
+                    try:
+                        tab.listen.stop()
+                    except Exception:
+                        pass
                 if not self.stop_event.is_set():
                     stock_ok = True
 
@@ -329,10 +410,12 @@ class XueqiuSpider:
                 continue
 
             # 组合
+            portfolio_listen_started = False
             try:
                 tab.get(f"https://xueqiu.com/u/{uid}")
                 SpiderTools.random_sleep(1.5, 2.0)
                 tab.listen.start(config.API['PORTFOLIO'])
+                portfolio_listen_started = True
                 
                 portfolio_btn = tab.ele('tag:a@@href=#/portfolio', timeout=4)
                 # 创建的组合会自动加载
@@ -340,7 +423,7 @@ class XueqiuSpider:
                 if portfolio_btn:
                     portfolio_btn.click(by_js=True)
                     SpiderTools.random_sleep(0.6, 1.0)
-                    end_time = time.time() + 6
+                    end_time = time.time() + float(getattr(config, "PORTFOLIO_LIST_WAIT_SECONDS", 6) or 6)
                     now_str = SpiderTools.get_now_str()
                     # 组合页签下通常有子页签：创建的组合 / 关注的组合（有时默认就是关注页）。
                     # 这里两者都抓，避免遗漏。
@@ -374,7 +457,7 @@ class XueqiuSpider:
                     created_tab = None
                     followed_tab = None
                     # Sub tabs may render asynchronously after entering portfolio; wait a bit.
-                    subtab_deadline = time.time() + 5
+                    subtab_deadline = time.time() + float(getattr(config, "PORTFOLIO_SUBTAB_WAIT_SECONDS", 5) or 5)
                     while time.time() < subtab_deadline and not (created_tab and followed_tab):
                         created_tab = created_tab or _find_sub_tab_any(("创建的组合",))
                         # 关注页在不同版本可能显示为“关注的组合”或“收藏的组合”
@@ -423,6 +506,24 @@ class XueqiuSpider:
                     def _process_iterator(iterator, default_build_or_collection):
                         if not iterator:
                             return
+                        # Materialize iterator once (we need to bulk query existing symbols).
+                        if not isinstance(iterator, list):
+                            try:
+                                iterator = list(iterator)
+                            except Exception:
+                                iterator = []
+                        if not iterator:
+                            return
+
+                        symbols_all = []
+                        for it in iterator:
+                            if not isinstance(it, dict):
+                                continue
+                            sym = it.get("symbol") or it.get("cube_symbol")
+                            if sym:
+                                symbols_all.append(sym)
+                        skip_set, last_map = self.db.should_skip_portfolios(symbols_all, config.PORTFOLIO_CACHE_HOURS)
+                        existing_symbols = set(last_map.keys())
 
                         comb_rows = []
                         update_rows = []
@@ -440,9 +541,13 @@ class XueqiuSpider:
                                 continue
                             processed_symbols.add(symbol)
 
-                            skip_detail, last_crawled = self.db.should_skip_portfolio(
-                                symbol, config.PORTFOLIO_CACHE_HOURS
-                            )
+                            # Decide whether to crawl detail:
+                            # - Skip if fresh within cache window
+                            # - Optionally skip detail entirely for existing combos (PORTFOLIO_DETAIL_ONLY_IF_NEW)
+                            last_crawled = last_map.get(symbol)
+                            skip_detail = symbol in skip_set
+                            if bool(getattr(config, "PORTFOLIO_DETAIL_ONLY_IF_NEW", False)) and symbol in existing_symbols:
+                                skip_detail = True
                             detail = None
                             if not skip_detail:
                                 try:
@@ -451,7 +556,9 @@ class XueqiuSpider:
                                     print(f"error in get portfolio information: {e}")
                                     detail = None
                             detail_ok = isinstance(detail, dict)
-                            last_crawled_value = now_str if detail_ok else last_crawled
+                            # If detail fetch failed and DB has no last_crawled yet, mark as crawled now
+                            # to avoid hammering the same detail page repeatedly under risk control.
+                            last_crawled_value = now_str if (detail_ok or last_crawled is None) else last_crawled
 
                             create_user_id = detail.get("create_user_id") if isinstance(detail, dict) else None
                             if str(create_user_id).isdigit():
@@ -779,7 +886,7 @@ class XueqiuSpider:
                         except Exception:
                             continue
 
-                        click_deadline = time.time() + 6
+                        click_deadline = time.time() + float(getattr(config, "PORTFOLIO_CLICK_WAIT_SECONDS", 6) or 6)
                         while time.time() < click_deadline:
                             res = tab.listen.wait(timeout=1.0)
                             if not res:
@@ -810,14 +917,17 @@ class XueqiuSpider:
                                 _process_iterator(iterator, default_build_or_collection=default_build_or_collection)
                                 break
 
+            except GlobalBackoff:
+                raise
             except Exception as e:
                 print(f"error in step2 in portfolio:{e}")
 
             finally:
-                try:
-                    tab.listen.stop()
-                except Exception:
-                    print("error in stop listening portfolio")
+                if portfolio_listen_started:
+                    try:
+                        tab.listen.stop()
+                    except Exception:
+                        pass
                 if not self.stop_event.is_set():
                     portfolio_ok = True
 
@@ -844,9 +954,13 @@ class XueqiuSpider:
                 ai_backlog = self.db.get_unanalyzed_count()
                 print(f"\n>>> [循环] 目标:{current_targets}/{config.TARGET_GOAL} | 用户库:{current_users}/{config.FOCUS_COUNT_LIMIT} | AI积压:{ai_backlog}")
                 
-                self.step1_batch_scan()
-                self.step2_batch_filter()
-                self.step3_batch_mine()
+                try:
+                    self.step1_batch_scan()
+                    self.step2_batch_filter()
+                    self.step3_batch_mine()
+                except GlobalBackoff as e:
+                    self._hibernate_and_restart(getattr(e, "seconds", 0), reason=getattr(e, "reason", "block"))
+                    continue
                 time.sleep(2)
 
         except KeyboardInterrupt:
