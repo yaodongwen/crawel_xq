@@ -8,6 +8,8 @@ class CommentsCrawler:
     def __init__(self, init_browser_fn, stop_event=None):
         self._init_browser_fn = init_browser_fn
         self._stop_event = stop_event
+        self._long_article_block_until_ts = 0.0
+        self._long_article_block_reason = None
 
     def _try_fetch_status_via_api(self, driver, status_id):
         """Prefer JSON API over HTML long-article page to reduce risk-control triggers."""
@@ -17,8 +19,6 @@ class CommentsCrawler:
             api_tab = driver.new_tab()
             api_tab.listen.start("statuses/show.json")
             api_tab.get(api_url)
-            # Do not call safe_action() here: slider/verification pages should trigger global backoff in the
-            # outer workflow, not loop/drag within this helper.
             res = api_tab.listen.wait(timeout=6)
             payload = SpiderTools.decode_response(res)
             if not payload:
@@ -29,8 +29,9 @@ class CommentsCrawler:
                         raise GlobalBackoff(sleep_s, reason=reason or "block")
                 # If the tab itself is a verification page, just skip long-article fetch for now.
                 try:
-                    if SpiderTools.has_slider(driver):
-                        return None
+                    SpiderTools.safe_action(driver, tab=api_tab)
+                except GlobalBackoff:
+                    raise
                 except Exception:
                     pass
                 return None
@@ -57,6 +58,7 @@ class CommentsCrawler:
                 pass
 
     def _mine_long_articles(self, driver, uid, status_id):
+        detail_tab = None
         """
         【修改版】长文获取逻辑：
         直接新建标签页访问长文 URL (https://xueqiu.com/uid/id)，
@@ -64,6 +66,8 @@ class CommentsCrawler:
         """
         try:
             if self._stop_event and self._stop_event.is_set():
+                return None
+            if time.time() < float(getattr(self, "_long_article_block_until_ts", 0.0) or 0.0):
                 return None
 
             # 0) Try JSON API first (usually avoids slider)
@@ -114,8 +118,21 @@ class CommentsCrawler:
             # print(f"    --> [补全成功] 长文 {status_id} ({len(full_text)}字)")
             return full_text
 
-        except GlobalBackoff:
-            raise
+        except GlobalBackoff as e:
+            cooldown_s = int(getattr(config, "LONG_ARTICLE_BLOCK_COOLDOWN_SECONDS", 1800) or 1800)
+            self._long_article_block_until_ts = time.time() + max(0, cooldown_s)
+            self._long_article_block_reason = getattr(e, "reason", "block")
+            mins = max(1, int(round(max(0, cooldown_s) / 60))) if cooldown_s > 0 else 0
+            print(
+                f"    -> [长文跳过] status_id={status_id} 触发 {getattr(e, 'reason', 'block')}，"
+                f"保留原始内容；暂停长文补全 {mins} 分钟，继续抓取其它动态"
+            )
+            try:
+                if detail_tab:
+                    detail_tab.close()
+            except Exception:
+                pass
+            return None
         except Exception as e:
             # print(f"    ⚠️ 长文补全失败 {status_id}: {e}")
             # 异常保护：如果标签页没关掉，强制关闭

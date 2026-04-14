@@ -110,13 +110,17 @@ AI_BATCH_SIZE = 8
 MIN_FOLLOWERS = 5000
 MIN_COMMENTS = 20
 
-# 组合(Portfolio/Cube)抓取缓存：在这段时间内再次遇到同一个组合就跳过“详情抓取”，
-# 仅通过列表接口补充/更新基础字段；超过时间再做增量更新（天）。
-PORTFOLIO_CACHE_HOURS = 3
+# 组合详情页重新抓取间隔（小时）。
+# 依据 User_Combinations.Portfolio_Last_Crawled 判断：
+# - 在这个时间窗口内抓过详情页，则本次不再进入组合详情页
+# - 超过这个时间窗口，再重新抓取详情页做增量同步
+PORTFOLIO_DETAIL_REFRESH_HOURS = 24 * 7
+# 兼容旧代码/旧配置名。
+PORTFOLIO_CACHE_HOURS = PORTFOLIO_DETAIL_REFRESH_HOURS
 
 # 仅对“新组合”（库里不存在）抓取详情页；已有组合只做列表层更新/关注关系落库。
-# 开启会更快，但会减少已有组合的持仓/调仓更新频率（需要的话关掉或调大 PORTFOLIO_CACHE_HOURS）。
-PORTFOLIO_DETAIL_ONLY_IF_NEW = False
+# 开启会更快，但会减少已有组合的持仓/调仓更新频率（需要的话关掉或调大 PORTFOLIO_DETAIL_REFRESH_HOURS）。
+PORTFOLIO_DETAIL_ONLY_IF_NEW = True
 
 # Step2 组合列表等待时长（秒）：等待 `portfolio/stock/list.json` 等响应
 PORTFOLIO_LIST_WAIT_SECONDS = 6
@@ -139,15 +143,22 @@ WAF_SLEEP_SECONDS = BLOCK_SLEEP_SECONDS
 HIBERNATE_ON_WAF = True
 SLIDER_SLEEP_SECONDS = BLOCK_SLEEP_SECONDS
 HIBERNATE_ON_SLIDER = True
+AUTO_SOLVE_SLIDER = True
+SLIDER_MAX_RETRIES = 10
+SLIDER_MAX_REFRESHES = 3
+SLIDER_DEBUG = True
 
 # 长文补全：优先使用 JSON API（推荐），避免打开 https://xueqiu.com/{uid}/{id} 详情页触发 405/滑块
 LONG_ARTICLE_API_ONLY = True
+LONG_ARTICLE_BLOCK_COOLDOWN_SECONDS = 1800
 
 # Step1 扫描关注列表：最多翻多少页（0 表示不限制；建议在风控较严时设一个上限）
 FOLLOW_SCAN_MAX_PAGES = 50
 
 # 输出 405 触发时的 url/title，便于排查误判
 BLOCK_DEBUG = True
+WAF_DEBUG = True
+MAX_CONSECUTIVE_GLOBAL_BACKOFFS = 3
 
 # 组合页签调试：输出“创建/关注/收藏”等子页签的文本，便于修正选择器
 PORTFOLIO_TAB_DEBUG = True

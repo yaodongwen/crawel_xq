@@ -318,6 +318,26 @@ class DBManager:
                 cur.execute(sql, tuple(symbols))
                 return {row[1]: row[0] for row in cur.fetchall()}
 
+    def delete_portfolio_positions_by_comb_ids(self, comb_ids):
+        if not comb_ids:
+            return
+        uniq = []
+        seen = set()
+        for x in comb_ids:
+            try:
+                cid = int(x)
+            except Exception:
+                continue
+            if cid <= 0 or cid in seen:
+                continue
+            seen.add(cid)
+            uniq.append(cid)
+        if not uniq:
+            return
+        placeholders = ",".join(["%s"] * len(uniq))
+        sql = f"DELETE FROM Portfolio_Positions WHERE Comb_Id IN ({placeholders})"
+        self.execute_one_safe(sql, tuple(uniq))
+
     def get_pending_tasks(self, table_name, limit=None):
         cutoff = (datetime.now() - timedelta(days=config.CACHE_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
 

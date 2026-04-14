@@ -97,15 +97,23 @@ class SpiderTools:
             # Be strict: if we can't confirm visibility, don't treat it as a slider signal.
             return False
 
+    @staticmethod
+    def _resolve_tab(driver, tab=None):
+        if tab is not None:
+            return tab
+        try:
+            return driver.latest_tab
+        except Exception:
+            return None
+
     @classmethod
-    def detect_slider(cls, driver):
+    def detect_slider(cls, driver, tab=None):
         """Detect whether current page is blocked by risk-control/captcha.
 
         Returns: (has_slider: bool, reason: str|None)
         """
-        try:
-            tab = driver.latest_tab
-        except Exception:
+        tab = cls._resolve_tab(driver, tab=tab)
+        if not tab:
             return False, None
 
         # 1) Most reliable: Aliyun slider handle exists and is displayed.
@@ -147,8 +155,8 @@ class SpiderTools:
         return False, None
 
     @classmethod
-    def has_slider(cls, driver):
-        has, _ = cls.detect_slider(driver)
+    def has_slider(cls, driver, tab=None):
+        has, _ = cls.detect_slider(driver, tab=tab)
         return has
 
     @staticmethod
@@ -163,9 +171,11 @@ class SpiderTools:
             pass
 
     @classmethod
-    def check_405(cls, driver):
+    def check_405(cls, driver, tab=None):
         try:
-            tab = driver.latest_tab
+            tab = cls._resolve_tab(driver, tab=tab)
+            if not tab:
+                return False
             title = tab.title or ""
             url = tab.url or ""
 
@@ -252,15 +262,14 @@ class SpiderTools:
             return False
 
     @classmethod
-    def check_waf(cls, driver):
+    def check_waf(cls, driver, tab=None):
         """Detect WAF-style block pages and trigger global backoff.
 
         Xueqiu sometimes returns an interstitial page like:
         "很抱歉...您的访问被阻断...请求ID..."
         """
-        try:
-            tab = driver.latest_tab
-        except Exception:
+        tab = cls._resolve_tab(driver, tab=tab)
+        if not tab:
             return False
         try:
             title = tab.title or ""
@@ -280,6 +289,7 @@ class SpiderTools:
 
         title_hit = any(h in title for h in hints)
         url_hit = any(h.lower() in (url or "").lower() for h in ("waf", "deny", "blocked"))
+        is_json = ".json" in (url or "").lower()
         text_hit = False
         if not (title_hit or url_hit):
             try:
@@ -290,6 +300,19 @@ class SpiderTools:
 
         if not (title_hit or url_hit or text_hit):
             return False
+
+        # JSON endpoints often render raw response text in the page, which can accidentally contain one of
+        # the WAF hint strings. For JSON tabs, require a stronger signal from title/url before treating it as WAF.
+        if is_json and not (title_hit or url_hit):
+            if bool(getattr(config, "WAF_DEBUG", False)) and text_hit:
+                print(f"\n>>> [WAF调试] JSON 请求疑似误判，忽略。title={title!r} url={url!r}")
+            return False
+
+        if bool(getattr(config, "WAF_DEBUG", False)):
+            print(
+                f"\n>>> [WAF调试] title={title!r} url={url!r} "
+                f"signals=title:{title_hit} url:{url_hit} text:{text_hit}"
+            )
 
         sleep_s = int(getattr(config, "WAF_SLEEP_SECONDS", getattr(config, "BLOCK_SLEEP_SECONDS", 600)))
         if sleep_s <= 0:
@@ -315,25 +338,75 @@ class SpiderTools:
         return True
 
     @classmethod
-    def safe_action(cls, driver):
+    def safe_action(cls, driver, tab=None):
+        tab = cls._resolve_tab(driver, tab=tab)
+        if not tab:
+            return
         # WAF block takes precedence.
-        if cls.check_waf(driver):
+        if cls.check_waf(driver, tab=tab):
             return
         # 405 block takes precedence.
-        if cls.check_405(driver):
+        if cls.check_405(driver, tab=tab):
             return
 
-        has, reason = cls.detect_slider(driver)
+        has, reason = cls.detect_slider(driver, tab=tab)
         if not has:
             return
 
         try:
-            url = getattr(driver.latest_tab, "url", "") or ""
+            url = getattr(tab, "url", "") or ""
         except Exception:
             url = ""
 
-        # Don't attempt to automatically bypass verification challenges.
         print(f">>> [滑块] 检测到验证页: {reason} | url={url}")
+
+        auto_solve = bool(getattr(config, "AUTO_SOLVE_SLIDER", True))
+        if auto_solve and reason == "aliyun_slider":
+            max_retries = int(getattr(config, "SLIDER_MAX_RETRIES", 10) or 10)
+            max_refreshes = int(getattr(config, "SLIDER_MAX_REFRESHES", 3) or 3)
+            debug = bool(getattr(config, "SLIDER_DEBUG", False))
+            attempts = 0
+            refreshes = 0
+
+            while True:
+                if cls.check_waf(driver, tab=tab):
+                    return
+                if cls.check_405(driver, tab=tab):
+                    return
+
+                has, current_reason = cls.detect_slider(driver, tab=tab)
+                if not has:
+                    return
+                if current_reason != "aliyun_slider":
+                    reason = current_reason
+                    break
+
+                attempts += 1
+                if attempts > 1 and debug:
+                    print(f">>> [滑块] 第 {attempts} 次自动拖动...")
+                cls.solve_slider(driver)
+                time.sleep(2)
+
+                has, current_reason = cls.detect_slider(driver, tab=tab)
+                if not has:
+                    return
+                if current_reason != "aliyun_slider":
+                    reason = current_reason
+                    break
+
+                if attempts >= max_retries:
+                    refreshes += 1
+                    if debug:
+                        print(f">>> [滑块] 自动拖动未解除，刷新页面重试 ({refreshes}/{max_refreshes})")
+                    try:
+                        tab.refresh()
+                    except Exception:
+                        pass
+                    time.sleep(3)
+                    attempts = 0
+                    tab = cls._resolve_tab(driver, tab=tab)
+                    if refreshes >= max_refreshes:
+                        break
 
         sleep_s = int(getattr(config, "SLIDER_SLEEP_SECONDS", getattr(config, "BLOCK_SLEEP_SECONDS", 600)))
         if sleep_s <= 0:
@@ -492,6 +565,17 @@ class SpiderTools:
             url = getattr(getattr(res, "request", None), "url", "") or ""
         except Exception:
             url = ""
+        try:
+            response = getattr(res, "response", None)
+            status_code = getattr(response, "status", None)
+            if status_code is None:
+                status_code = getattr(response, "status_code", None)
+            if status_code is not None:
+                status_code = int(status_code)
+            if status_code in (403, 405, 429) and "xueqiu.com" in url:
+                return True, f"http_{status_code}"
+        except Exception:
+            pass
 
         snippet = cls.response_text_snippet(res, limit=1200)
         if not snippet:

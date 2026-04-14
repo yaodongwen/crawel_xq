@@ -522,7 +522,15 @@ class XueqiuSpider:
                             sym = it.get("symbol") or it.get("cube_symbol")
                             if sym:
                                 symbols_all.append(sym)
-                        skip_set, last_map = self.db.should_skip_portfolios(symbols_all, config.PORTFOLIO_CACHE_HOURS)
+                        detail_refresh_hours = float(
+                            getattr(
+                                config,
+                                "PORTFOLIO_DETAIL_REFRESH_HOURS",
+                                getattr(config, "PORTFOLIO_CACHE_HOURS", 24 * 7),
+                            )
+                            or 24 * 7
+                        )
+                        skip_set, last_map = self.db.should_skip_portfolios(symbols_all, detail_refresh_hours)
                         existing_symbols = set(last_map.keys())
 
                         comb_rows = []
@@ -546,19 +554,21 @@ class XueqiuSpider:
                             # - Optionally skip detail entirely for existing combos (PORTFOLIO_DETAIL_ONLY_IF_NEW)
                             last_crawled = last_map.get(symbol)
                             skip_detail = symbol in skip_set
-                            if bool(getattr(config, "PORTFOLIO_DETAIL_ONLY_IF_NEW", False)) and symbol in existing_symbols:
+                            if bool(getattr(config, "PORTFOLIO_DETAIL_ONLY_IF_NEW", False)) and symbol in existing_symbols and last_crawled:
                                 skip_detail = True
                             detail = None
                             if not skip_detail:
                                 try:
                                     detail = self._portfolio_crawler._mine_portfolio(symbol)
+                                except GlobalBackoff as e:
+                                    raise
                                 except Exception as e:
                                     print(f"error in get portfolio information: {e}")
                                     detail = None
                             detail_ok = isinstance(detail, dict)
-                            # If detail fetch failed and DB has no last_crawled yet, mark as crawled now
-                            # to avoid hammering the same detail page repeatedly under risk control.
-                            last_crawled_value = now_str if (detail_ok or last_crawled is None) else last_crawled
+                            # Only mark detail as crawled after a successful detail fetch.
+                            # This keeps failed/new combos retryable in later runs.
+                            last_crawled_value = now_str if detail_ok else last_crawled
 
                             create_user_id = detail.get("create_user_id") if isinstance(detail, dict) else None
                             if str(create_user_id).isdigit():
@@ -762,6 +772,19 @@ class XueqiuSpider:
                             self.db.upsert_stocks(stock_upsert_rows)
                         stock_id_map = self.db.get_stock_id_map([r[0] for r in stock_upsert_rows if r and r[0]])
 
+                        detail_success_comb_ids = []
+                        for symbol, detail, creator_id in detail_cache:
+                            if not isinstance(detail, dict):
+                                continue
+                            comb_id = comb_id_map.get(symbol)
+                            if comb_id:
+                                detail_success_comb_ids.append(comb_id)
+
+                        # Portfolio_Positions stores the current holding snapshot.
+                        # On each successful detail crawl, replace the previous snapshot for that combination.
+                        if detail_success_comb_ids:
+                            self.db.delete_portfolio_positions_by_comb_ids(detail_success_comb_ids)
+
                         position_rows = []
                         for comb_id, seg_name, seg_weight, stock_symbol, stock_price, stock_weight, updated_at in position_rows_raw:
                             stock_id = stock_id_map.get(str(stock_symbol).strip()) if stock_symbol else None
@@ -807,7 +830,13 @@ class XueqiuSpider:
                                     Comb_Id, Stock_Id, Prev_Weight, Target_Weight,
                                     Price, Cash_Value, Status, Transaction_Time, Notes
                                 ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                                ON CONFLICT DO NOTHING
+                                ON CONFLICT (Comb_Id, Transaction_Time, Stock_Id) DO UPDATE SET
+                                    Prev_Weight = EXCLUDED.Prev_Weight,
+                                    Target_Weight = EXCLUDED.Target_Weight,
+                                    Price = EXCLUDED.Price,
+                                    Cash_Value = EXCLUDED.Cash_Value,
+                                    Status = EXCLUDED.Status,
+                                    Notes = EXCLUDED.Notes
                                 """,
                                 rebalance_rows,
                             )
@@ -944,6 +973,7 @@ class XueqiuSpider:
         print("\n" + "="*50); input(">>> 请扫码登录，完成后按【回车】..."); print("="*50 + "\n")
         
         interrupted = False
+        consecutive_global_backoffs = 0
         try:
             while True:
                 current_targets = self.db.get_target_count()
@@ -958,8 +988,16 @@ class XueqiuSpider:
                     self.step1_batch_scan()
                     self.step2_batch_filter()
                     self.step3_batch_mine()
+                    consecutive_global_backoffs = 0
                 except GlobalBackoff as e:
-                    self._hibernate_and_restart(getattr(e, "seconds", 0), reason=getattr(e, "reason", "block"))
+                    consecutive_global_backoffs += 1
+                    max_backoffs = int(getattr(config, "MAX_CONSECUTIVE_GLOBAL_BACKOFFS", 3) or 3)
+                    reason = getattr(e, "reason", "block")
+                    print(f">>> [全局退避] 连续触发 {reason}: {consecutive_global_backoffs}/{max_backoffs}")
+                    if consecutive_global_backoffs >= max_backoffs:
+                        print(">>> [停止] 连续多次触发全局风控，继续重试大概率没有进度，请先人工处理后再重启。")
+                        break
+                    self._hibernate_and_restart(getattr(e, "seconds", 0), reason=reason)
                     continue
                 time.sleep(2)
 
