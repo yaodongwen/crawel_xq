@@ -4,4 +4,8 @@ train_models/model_finbert_regression/
 train_models/model_intent_classifier_best/
 train_models/model_transformer_intention/
 train_models/data/
+.vscode/
+*/.cahe/
+data
+tools/output/
 __pycache__
